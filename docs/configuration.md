@@ -56,7 +56,7 @@ capturing its own outputs as source data.
 | `processed_dir` | yes | Base for per-run signals, gold tables, evaluations, and replay records. |
 | `models_dir` | yes | Base for per-run model and metric artifacts. |
 | `reports_dir` | yes | Base for config snapshots, manifests, and research notes. |
-| `llm_model` | no | Local generative model directory. Required only when `llm_annotations.enabled` is true. |
+| `llm_model` | no | Direct path to one local GGUF model file. Required only when `llm_annotations.enabled` is true. |
 
 Optional input example:
 
@@ -73,7 +73,7 @@ paths:
   processed_dir: ../data/processed/local
   models_dir: ../models/local
   reports_dir: ../reports/local
-  llm_model: /absolute/path/to/immutable/local-model
+  llm_model: /absolute/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf
 ```
 
 ## `data`
@@ -250,40 +250,91 @@ explicit, licensed, reproducible choice.
 
 ## `llm_annotations`
 
-This separate optional component runs a local causal language model to produce validated per-entity
-semantic/evidence signals. It is disabled and local-files-only in every bundled config, so the
-deterministic sample and baseline do not require a model or PyTorch.
+This separate optional component runs one local GGUF model through `llama-cpp-python==0.3.34` to
+produce validated per-entity semantic/evidence signals. It is disabled in every bundled config and
+`paths.llm_model` defaults to null. The deterministic sample and baseline therefore require neither
+the `llm` extra nor a model file.
 
 | Field | Default or allowed value | Meaning |
 |---|---|---|
 | `enabled` | `false` | Runs the annotation stage when true. |
 | `feature_mode` | `sidecar` or `augment` | `sidecar` records verified output without adding LLM feature values. `augment` adds separate `llm_*` columns and requires `enabled: true` plus the six canonical LLM-ablation model families. |
-| `backend` | `transformers_causal_lm` | Local Hugging Face causal-LM backend. |
-| `model_id` | `null` | Stable human/model-registry identifier; required when enabled. It is recorded separately from `paths.llm_model`. |
-| `model_revision` | `null` | Exact immutable model revision/version; required when enabled. |
-| `model_license_or_terms_ref` | `null` | Human-resolvable license/terms reference for local model use; required when enabled. |
+| `backend` | `llama_cpp_gguf` | The only supported generative backend. It loads the configured GGUF directly in the Python process. |
+| `model_id` | `unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL` | Logical model selector recorded separately from the local file path. |
+| `model_revision` | `5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf` | Exact pinned repository revision. |
+| `model_license_or_terms_ref` | pinned Hugging Face revision URL | Human-resolvable license/terms reference. Recording it does not grant model or source-data rights. |
 | `prompt_version` | `semantic-evidence-v2` | Version included in prompt provenance and cache identity. |
 | `schema_version` | `semantic-signal-v2` | Version of the validated structured-output contract. |
 | `verifier_version` | `semantic-evidence-verifier-v1` | Version of the deterministic request/response verifier and cache identity. |
-| `batch_size` | `1`, integer ≥ 1 | Configurable generation batch size. |
-| `max_input_tokens` | `2048`, integer ≥ 1 | Context budget; an oversized request abstains rather than silently truncating source text. |
-| `max_new_tokens` | `384`, integer ≥ 1 | Maximum generated tokens per request. |
+| `batch_size` | `1`, integer ≥ 1 | Number of host requests grouped for accounting. The backend still submits each request through ordinary in-process generation; it does not imply simultaneous token generation. |
+| `max_input_tokens` | `2048`, integer ≥ 1 | Maximum prompt size. An oversized request abstains rather than silently truncating source text. |
+| `max_new_tokens` | `384`, integer ≥ 1 | Maximum reply size for one request. |
+| `context_tokens` | `8192`, integer ≥ 1 | Total model window available to the prompt and reply. It must be at least `max_input_tokens + max_new_tokens`. |
+| `prompt_batch_tokens` | `512`, integer ≥ 1 | Internal llama.cpp prompt-evaluation chunk size, not the number of documents. It cannot exceed `context_tokens`. |
+| `gpu_layers` | `-1`, integer ≥ -1 | `-1` requests all possible layers on llama.cpp Metal, `0` forces CPU, and a positive value requests that many layers. If the binding reports no GPU-offload support, the runtime uses `0`. |
+| `flash_attention` | `true` | Requests llama.cpp flash attention when the installed build/model supports it. |
+| `use_mmap` | `true` | Memory-maps the GGUF instead of eagerly reading the whole file. It does not remove the need for runtime working memory. |
 | `decoding` | `greedy` | Deterministic decoding policy. |
-| `seed` | `7`, integer | Recorded generation seed. |
+| `seed` | `7`, integer ≥ 1 | Recorded generation seed. |
 | `input_cost_per_million_tokens_usd` | `null` or non-negative float | Optional configured input-token rate used only to estimate cost for newly generated responses with recorded token counts. |
 | `output_cost_per_million_tokens_usd` | `null` or non-negative float | Optional configured output-token rate. It must be set together with the input rate. |
-| `local_files_only` | `true` | Forbids model/tokenizer downloads; keep true for this local-only component. |
-| `trust_remote_code` | `false` | Prevents execution of model-repository custom code; keep false. |
 
-`paths.llm_model` must name the local model directory when enabled. The run input manifest hashes
-its exact files, while the config and annotation provenance retain the logical ID/revision/license,
-prompt/schema/verifier versions, decoding settings, context limits, and optional token rates.
-Inference uses central MPS-or-CPU device selection. Tests inject a generator and never load or
-download a real model. Configured costs are estimates, not invoices; if rates or token counts are
-unavailable for a generated response, its per-round estimated cost remains null rather than being
-invented. If any newly generated response lacks token counts, run-level token totals and configured
-cost are null rather than partial. Without configured rates, the run-level cost estimate is also
-null.
+The default setup is pinned to the direct local file
+`Qwen3.6-27B-UD-Q4_K_XL.gguf`. For the default model ID and revision, startup requires this exact
+SHA-256:
+
+```text
+4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095
+```
+
+A mismatch fails before inference. The file is about 17.9 GB; 32 GB or more of unified memory is a
+practical starting point because context, key/value cache, and other working buffers need additional
+memory. Keep `batch_size: 1` first and reduce the context if necessary. `use_mmap` can reduce eager
+copying but does not guarantee that a lower-memory Mac can run the model.
+
+Example enabled sidecar configuration:
+
+```yaml
+paths:
+  llm_model: /absolute/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf
+llm_annotations:
+  enabled: true
+  feature_mode: sidecar
+  backend: llama_cpp_gguf
+  model_id: unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL
+  model_revision: 5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
+  model_license_or_terms_ref: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/tree/5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
+  batch_size: 1
+  max_input_tokens: 2048
+  max_new_tokens: 384
+  context_tokens: 8192
+  prompt_batch_tokens: 512
+  gpu_layers: -1
+  flash_attention: true
+  use_mmap: true
+```
+
+The runtime never resolves the logical selector or downloads weights. Download the GGUF yourself,
+review its license/terms, and provide the direct file path. The run input manifest and annotation
+provenance record its exact bytes as `model_file_sha256`. Provenance also records the
+`llama-cpp-python` version, requested/effective GPU layers, the GGUF-embedded chat-template hash,
+context/runtime settings, and `backend: llama_cpp_gguf`. A missing embedded chat template is an
+error; the runtime does not silently substitute an unversioned template.
+
+Metal here means llama.cpp layer offload, not PyTorch MPS. The native binding decides whether GPU
+offload is available. The runtime uses CPU when the installed binding reports no GPU support or
+when `gpu_layers: 0` is set. A Metal-enabled build can still initialize Metal with zero offloaded
+layers, so a machine that cannot create a Metal context needs a CPU-only build. The repository/model
+name contains `MTP`, but the in-process API performs ordinary inference and records
+`mtp_speculative_decoding: false`; this integration makes no MTP acceleration claim.
+
+Normal tests inject a generator and never load or download a real model. Passing them proves the
+host contracts, cache, verifier, and fake-backend integration, not that this GGUF loads or generates
+on a particular Mac. Use the gated acceptance test in [Workflows](workflows.md) for that check.
+Configured costs are estimates, not invoices; if rates or token counts are unavailable for a newly
+generated response, its per-round estimated cost remains null rather than being invented. If any
+newly generated response lacks token counts, run-level token totals and configured cost are null
+rather than partial. Without configured rates, the run-level cost estimate is also null.
 
 The two enabled modes are intentionally distinct:
 

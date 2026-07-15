@@ -200,6 +200,15 @@ annotation-stage completion time is audit metadata, not evidence that the chosen
 ran at that historical instant. This is a retrospective parsing assumption; see
 [Research protocol](research_protocol.md) before interpreting a historical run.
 
+The model itself is also a local input. `paths.llm_model` must point directly to one immutable GGUF
+file. The runtime records its exact SHA-256 as `model_file_sha256` and does not download or resolve a
+model-hub selector. The bundled default expects `Qwen3.6-27B-UD-Q4_K_XL.gguf` from selector
+`unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL`, revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf`, with SHA-256
+`4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095`. The file is about
+17.9 GB; model weights plus inference working memory make 32 GB or more of unified memory a practical
+starting point. See [Workflows](workflows.md) for the explicit download and verification steps.
+
 ### Social-data warning
 
 Hashing raw identifiers in silver does not erase them from bronze. The bronze store preserves the
@@ -266,8 +275,8 @@ feature builder. Event records never calculate or replace the market bar’s cau
 - [ ] Social identifiers and retention status follow source terms.
 - [ ] License/terms references are meaningful and current.
 - [ ] Input paths are outside artifact roots.
-- [ ] If generative annotation is enabled, its exact local model directory and model license are
-  recorded and the directory is outside artifact roots.
+- [ ] If generative annotation is enabled, its direct local GGUF path, SHA-256, exact revision, and
+  model license/terms reference are recorded, and the file is outside artifact roots.
 - [ ] The requested interval includes enough source history and future label bars.
 
 Run:

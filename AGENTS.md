@@ -128,8 +128,11 @@ The useful baseline must remain deterministic and must not require a large langu
 
 Optional transformer or LLM components must:
 
-- support batching, CPU fallback, and MPS where available;
+- support batching and CPU fallback; PyTorch transformers may use MPS, while GGUF inference may use
+  llama.cpp Metal offload when the installed binding supports it;
 - avoid downloads during tests;
+- load generative GGUF weights from one direct user-provided local file and never download model
+  weights at runtime;
 - cache outputs by canonical text hash and model/config version;
 - version prompts, models, decoding settings, and output schemas;
 - validate structured output and retain uncertainty;
@@ -184,8 +187,11 @@ integrations, or remote vector databases unless a demonstrated requirement justi
 ## Apple Silicon and local performance
 
 - Do not assume CUDA, x86, or Rosetta.
-- Centralize optional device selection in `src/nlp_trader/utils/device.py`: MPS when available,
-  otherwise CPU.
+- Centralize optional device selection in `src/nlp_trader/utils/device.py`: MPS-or-CPU for PyTorch
+  transformers and llama.cpp Metal-layer-offload-or-CPU for GGUF inference. Do not call llama.cpp
+  Metal execution MPS.
+- Do not claim MTP or speculative-decoding acceleration unless the in-process backend actually
+  implements and verifies it; ordinary llama.cpp generation is not MTP acceleration.
 - Keep model/inference batch sizes configurable.
 - Use conservative macOS-safe worker defaults and guard process pools with
   `if __name__ == "__main__":`.
@@ -200,6 +206,8 @@ integrations, or remote vector databases unless a demonstrated requirement justi
 
 Tests must not require network access, vendor credentials, paid APIs, CUDA, or MPS. Use tiny
 synthetic/redistributable fixtures, fixed seeds, and tolerant floating-point assertions.
+Normal tests must not require the real multi-gigabyte GGUF. Keep any real-model load/generation check
+behind an explicit environment-gated acceptance test.
 
 Maintain coverage for:
 

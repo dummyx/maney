@@ -243,6 +243,97 @@ path. Tests deliberately do not download models.
 
 The centralized device helper falls back to CPU. This is supported behavior, not an error.
 
+## GGUF generative LLM problems
+
+### `Generative LLM annotations require llama-cpp-python`
+
+The generative backend uses the separate `llm` extra, not the transformer `nlp` extra. On Apple
+Silicon, install the pinned `llama-cpp-python==0.3.34` build with Metal enabled:
+
+```bash
+CMAKE_ARGS="-DGGML_METAL=on" uv sync --extra llm --locked
+```
+
+Installing the extra does not download model weights. Follow the explicit model download and
+checksum steps in [Workflows](workflows.md#optional-local-generative-semanticevidence-annotation).
+
+### `llm_model must be an existing local GGUF file`
+
+Set `paths.llm_model` to the file itself, for example:
+
+```yaml
+paths:
+  llm_model: /absolute/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf
+```
+
+A directory, model-hub selector, missing path, or non-`.gguf` file is rejected. The runtime never
+downloads or resolves the configured model ID.
+
+### `default Qwen GGUF SHA-256 mismatch`
+
+The default selector `unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL` and revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf` require
+`Qwen3.6-27B-UD-Q4_K_XL.gguf` with this checksum:
+
+```text
+4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095
+```
+
+Check it with `shasum -a 256 /absolute/path/Qwen3.6-27B-UD-Q4_K_XL.gguf`. Do not relabel a different
+file or revision to bypass the check. Download the pinned file again from the licensed source if the
+local copy is incomplete or different.
+
+### `local GGUF model must contain an embedded chat template`
+
+The backend uses the chat template stored in the GGUF metadata and records its SHA-256. It does not
+guess or fetch a template. Use the exact pinned file, or choose another GGUF whose metadata includes
+`tokenizer.chat_template` and record that model's real ID, revision, checksum, and terms.
+
+### The model runs out of memory or Metal is not used
+
+The default file is about 17.9 GB, and inference also needs context, key/value cache, and working
+buffers. At least 32 GB of unified memory is a practical starting point, not a guarantee. Keep
+`batch_size: 1`, close memory-heavy applications, and reduce `context_tokens` only while preserving
+`max_input_tokens + max_new_tokens <= context_tokens`.
+
+`gpu_layers: -1` requests all possible llama.cpp Metal layers. If the installed native binding
+reports no GPU-offload support, the host uses CPU with zero GPU layers. This is llama.cpp Metal, not
+PyTorch MPS. `use_mmap: true` avoids one eager file copy but does not make the 17.9 GB model fit into
+insufficient memory.
+
+### Metal context creation fails
+
+First close memory-heavy applications and check that the configured context fits in unified memory.
+A Metal-enabled llama.cpp build may initialize Metal even when `gpu_layers: 0`, so retrying the same
+build with zero offloaded layers is not a dependable CPU fallback. To run without Metal, rebuild the
+optional dependency as CPU-only:
+
+```bash
+CMAKE_ARGS="-DGGML_METAL=OFF" \
+  uv sync --extra llm --locked --reinstall-package llama-cpp-python --no-cache
+```
+
+`--no-cache` matters when changing build modes because it prevents reuse of the existing
+Metal-enabled wheel. The runtime then detects that GPU offload is unavailable and uses CPU. Expect
+the 27B model to be much slower than Metal inference.
+
+The model repository name includes `MTP`, but this backend uses ordinary inference. There is no MTP
+speculative-decoding acceleration to enable in the current implementation.
+
+### The real-model test is skipped
+
+Normal tests intentionally do not load the large licensed model. After installing the `llm` extra
+and verifying the file, opt in explicitly:
+
+```bash
+NLP_TRADER_RUN_REAL_LLM=1 \
+NLP_TRADER_LLM_MODEL_PATH=/absolute/path/Qwen3.6-27B-UD-Q4_K_XL.gguf \
+uv run pytest tests/acceptance/test_llama_cpp_qwen.py -v
+```
+
+This acceptance test checks real local model loading and inference. The normal fake/injected tests
+cannot establish that, and neither test establishes extraction quality or trading performance.
+
 ## Broker problems
 
 ### Cannot connect to kabuStation or responses look artificial

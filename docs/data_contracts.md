@@ -269,8 +269,13 @@ bars, and text items are required. Fundamentals, earnings calendar, and corporat
 optional. Each configured source must be an existing file or a nonempty Parquet directory. Input
 paths may not overlap any artifact root, and raw/interim/processed/model/report roots must be
 mutually non-overlapping. The system does not download, revise, adjust, or infer missing vendor data.
-When generative annotation is enabled, `paths.llm_model` must be a nonempty local model directory and
-must not overlap an artifact root.
+When generative annotation is enabled, `paths.llm_model` must be one existing local file with a
+`.gguf` extension, not a directory or model-hub selector, and it must not overlap an artifact root.
+The runtime never downloads the file. It hashes the exact bytes before loading, records that identity
+as `model_file_sha256` in annotation/provenance artifacts (and as `model.sha256` in each
+DecisionRound), and rejects a file that changes during loading. The `llama_cpp_gguf` backend also
+requires a chat template embedded in GGUF metadata and records its SHA-256; missing template metadata
+is a hard error rather than an implicit prompt-format change.
 
 See [Outputs](outputs.md) for the materialized tree and [Research protocol](research_protocol.md) for
 the human review checklist.

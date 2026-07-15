@@ -20,6 +20,13 @@ uv sync --locked
 
 The baseline intentionally excludes deep-learning packages.
 
+It also excludes the optional GGUF language-model runtime. A normal `uv run pytest` or sample smoke
+uses injected/fake LLM paths and does not prove that a real model can load, use Metal, or generate a
+valid response on this Mac. The opt-in model is a separate 17.9 GB download and is most practical on
+a Mac with at least 32 GB of unified memory. Complete the baseline sample first, then follow
+[Optional local generative semantic/evidence annotation](workflows.md#optional-local-generative-semanticevidence-annotation)
+for the explicit install, download, configuration, and gated real-model acceptance test.
+
 ## 2. Validate the sample configuration
 
 ```bash

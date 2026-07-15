@@ -53,6 +53,26 @@ and the [Japan baseline preparation guide](japan_baseline.md).
   model’s license or terms reference. Model access does not expand the rights granted by the source
   license.
 
+The bundled generative settings identify
+`unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL` at revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf` and record this terms reference:
+
+```text
+https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/tree/5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
+```
+
+That reference, the expected SHA-256
+`4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095`, and the
+project’s download instructions are provenance, not permission or legal advice. Before downloading
+the 17.9 GB `Qwen3.6-27B-UD-Q4_K_XL.gguf`, review the quantized artifact’s terms, applicable upstream
+model license, access conditions, and any output/use restrictions for the intended jurisdiction and
+research. Keep required notices and an immutable copy of the terms used for the experiment.
+
+Model acquisition is an explicit operator action. The pipeline accepts a direct local GGUF path and
+never downloads weights at runtime or during normal tests. `model_file_sha256` proves which bytes the
+run used; it does not prove that possession, processing of source text, redistribution, or output use
+is permitted.
+
 The generative component is a constrained semantic/evidence parser. It receives only the current
 source item, host-linked candidates, source-local numbered spans, noisy source type/quality, and the
 configured horizon. The host records a safe decision time, but that date is omitted from the model

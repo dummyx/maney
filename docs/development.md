@@ -18,7 +18,16 @@ Optional transformer dependencies:
 uv sync --extra nlp
 ```
 
-Do not make the baseline depend on PyTorch or a model download.
+Optional GGUF generative dependency on Apple Silicon:
+
+```bash
+CMAKE_ARGS="-DGGML_METAL=on" uv sync --extra llm --locked
+```
+
+The `llm` extra contains `llama-cpp-python==0.3.34`; it is separate from `nlp` and does not download
+weights. Keep model acquisition an explicit operator step.
+
+Do not make the baseline depend on PyTorch, `llama-cpp-python`, or a model download.
 
 ## Repository map
 
@@ -44,6 +53,7 @@ src/nlp_trader/
   reports.py                Markdown research notes
   schemas/                  typed boundary records
 tests/
+  acceptance/               explicitly gated real local model checks
   unit/                     component contracts and edge cases
   integration/              generated-data stage composition
   property/                 generated invariant checks across broad input ranges
@@ -73,12 +83,29 @@ the exact lockfile before switching uv to offline, no-sync execution, which sepa
 installation from the no-dependency-access checks. This is not an operating-system-level network
 sandbox.
 
-The macOS job verifies the baseline on Apple Silicon. It deliberately omits the optional `nlp`
-extra, so it does not claim that PyTorch or MPS inference was exercised.
+The macOS job verifies the baseline on Apple Silicon. It deliberately omits the optional `nlp` and
+`llm` extras, so it does not claim that PyTorch/MPS or real GGUF/Metal inference was exercised.
 
 Tests must not require vendor credentials, paid APIs, network access, CUDA, or MPS. Use fixed seeds
 and tolerant floating-point assertions. Hypothesis property tests cover cost monotonicity,
 post-construction portfolio limits, determinism, and point-in-time provenance rejection.
+
+Normal LLM unit/integration tests inject a fake generator and must not require the 17.9 GB GGUF.
+They cover contracts, cache identity, native-binding configuration, fallback behavior, and
+provenance, but they do not prove that a real model loads or generates. Developers who have reviewed
+the model terms, installed the `llm` extra, and verified the local file can run:
+
+```bash
+NLP_TRADER_RUN_REAL_LLM=1 \
+NLP_TRADER_LLM_MODEL_PATH=/absolute/path/Qwen3.6-27B-UD-Q4_K_XL.gguf \
+uv run pytest tests/acceptance/test_llama_cpp_qwen.py -v
+```
+
+This acceptance test is opt-in and must stay skipped without the environment gate. A Mac with at
+least 32 GB of unified memory is the practical starting point for the 17.9 GB model and its working
+buffers. The same test can run with a CPU-only llama.cpp build, but the repository does not maintain
+a second CPU-only environment. Device selection for that path has regular test coverage; validate
+real CPU inference separately before relying on a CPU-only deployment.
 
 If the full suite is impractical during a narrow edit, run targeted tests while working, then run the
 full gates before handoff. If a gate truly cannot run, state exactly what was skipped and why.
@@ -94,7 +121,8 @@ full gates before handoff. If a gate truly cannot run, state exactly what was sk
 - Preserve user changes in a dirty tree and avoid unrelated rewrites.
 - Use Polars lazy scans for large Parquet sources; filter/project before joins.
 - Keep batch sizes and local-development bounds configurable.
-- Centralize optional MPS/CPU selection in `utils/device.py`.
+- Centralize optional device selection in `utils/device.py`: MPS/CPU for PyTorch and llama.cpp
+  Metal-layer-offload/CPU for GGUF. Do not describe llama.cpp Metal as MPS.
 
 ## Add or change an input provider
 
@@ -168,8 +196,15 @@ No backtest or paper change authorizes live routing.
 
 ## Change optional generative LLM behavior
 
-- Keep the baseline independent of PyTorch and keep model loading local-files-only with remote custom
-  code disabled.
+- Keep the baseline independent of PyTorch and `llama-cpp-python`. Keep the latter pinned in the
+  separate `llm` extra.
+- Load exactly one direct user-provided GGUF path. Do not resolve a hub selector, download weights,
+  or execute repository code at runtime.
+- Preserve `model_file_sha256`, the pinned logical model/revision/license reference,
+  `llama-cpp-python` version, GGUF-embedded chat-template hash, context settings, and requested and
+  effective GPU layers in provenance and cache identity.
+- Treat llama.cpp Metal offload and CPU fallback as separate from PyTorch MPS. Do not claim MTP or
+  speculative-decoding acceleration for the ordinary in-process chat-completion API.
 - Preserve current-source-only prompts unless a separately designed, point-in-time evidence store is
   added; do not imply that RAG, tools, or routing exist.
 - Keep conventional sentiment/event fields separate from `llm_*` fields. Augmentation must retain the
@@ -185,7 +220,8 @@ No backtest or paper change authorizes live routing.
   and hashes. Do not populate tool, calibration, portfolio, risk, order, or outcome fields until an
   explicit later design extends that boundary.
 - Add injected-generator/cache/failure-before-parse, leakage, verifier, feature-family, ablation, and
-  DecisionRound tamper/replay tests without requiring a model download or MPS.
+  DecisionRound tamper/replay tests without requiring a model download or accelerator. Keep one
+  environment-gated acceptance test for the pinned real GGUF path.
 
 ## Documentation ownership
 

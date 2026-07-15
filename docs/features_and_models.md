@@ -247,6 +247,22 @@ one document-level sentiment/event result to every linked entity. A document suc
 gains share while Company B cuts guidance” can instead receive separate, source-grounded entity
 signals without changing the conventional result.
 
+This path is disabled by default and is not part of the deterministic baseline. When enabled, the
+`llama_cpp_gguf` backend uses `llama-cpp-python==0.3.34` to load one direct local GGUF file; it does
+not download or resolve model weights. The bundled logical selector is
+`unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL` at revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf`, with local filename
+`Qwen3.6-27B-UD-Q4_K_XL.gguf` and expected SHA-256
+`4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095`. The file is about
+17.9 GB, so 32 GB or more of unified memory is a practical starting point after inference working
+memory is included.
+
+The runtime records the exact bytes as `model_file_sha256`, requires and hashes the chat template
+embedded in the GGUF, and records the llama.cpp version, context sizes, and requested/effective GPU
+layers. A Metal-enabled binding may offload layers; otherwise inference falls back to CPU. This is
+llama.cpp Metal rather than PyTorch MPS. Despite `MTP` in the model name, the current in-process
+chat-completion API performs ordinary inference and does not use MTP speculative acceleration.
+
 For each text item, the host supplies only deterministically linked, historically active asset
 candidates, numbered spans from that item, noisy source type/quality metadata, the first safe market
 decision at or after source availability, and the configured prediction horizon. There is no RAG,
@@ -292,6 +308,10 @@ local evaluator reports stance and primary-event macro-F1, supporting- and count
 horizon accuracy, abstention and invalid-response rates, plus raw-confidence Brier and calibration
 diagnostics. These are extraction-quality metrics only; raw confidence is not promoted to a
 calibrated probability and the evaluator consumes no price, return, portfolio, or backtest outcome.
+
+Normal automated tests use an injected generator and do not establish real GGUF loading or
+inference. The environment-gated acceptance command in [Workflows](workflows.md) performs that local
+check; neither it nor the fake tests establish research usefulness.
 
 See [Research protocol](research_protocol.md) for the sidecar-first experiment and pretrained-memory
 limitation, and [Outputs](outputs.md) for the DecisionRound boundary.

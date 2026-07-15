@@ -43,6 +43,20 @@ raw-confidence calibration diagnostics. Freeze the local model bytes, prompt ver
 verifier version, decoding settings, token-cost assumptions, and labeled set before market
 evaluation.
 
+For the bundled default, freeze the direct file `Qwen3.6-27B-UD-Q4_K_XL.gguf`, logical selector
+`unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL`, revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf`, and SHA-256
+`4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095`. Retain the
+`model_file_sha256`, `backend: llama_cpp_gguf`, `llama-cpp-python` version, embedded chat-template
+hash, context sizes, and requested/effective GPU layers. Changing any of those creates a different
+model/runtime condition and requires a new experiment identity.
+
+Run the environment-gated real-model acceptance test on the target Mac before collecting sidecars.
+The normal test suite uses injected generators and does not prove that the 17.9 GB model loads or
+generates there. Conversely, a successful acceptance test proves only local loading/inference, not
+annotation accuracy. The default model name includes `MTP`, but this backend performs ordinary
+in-process inference; do not attribute a result or speed claim to MTP speculative decoding.
+
 Sidecar review must include the processing and deterministic-verification summaries, raw generation
 attempts, exact response artifacts, and replay-verified DecisionRound ledger. The verifier must pass
 its identity/coverage, timing, horizon, evidence-reference, and cited-numeric-token checks. Passing
@@ -94,11 +108,12 @@ completion it writes an exclusive final manifest containing:
 - cost model, portfolio constraints, metrics, known limitations, and next questions
 
 An enabled generative run additionally retains newly generated attempts before parsing, exact
-successful/cache response records, prompt/schema/verifier provenance, verified Silver rows,
-processing/verification summaries, and a canonical DecisionRound ledger. The ledger is written once
-and replay-verified from the stored output; it does not regenerate the model response. Its current
-scope ends at semantic parsing and deliberately contains no tools, calibration, portfolio, risk,
-orders, or realized outcome.
+successful/cache response records, `model_file_sha256`, backend/llama.cpp/runtime and embedded-template
+provenance, prompt/schema/verifier provenance, verified Silver rows, processing/verification
+summaries, and a canonical DecisionRound ledger. The ledger is written once and replay-verified from
+the stored output; it does not regenerate the model response. Its current scope ends at semantic
+parsing and deliberately contains no tools, calibration, portfolio, risk, orders, or realized
+outcome.
 
 CLI overrides are applied to the typed config before run creation. This includes runtime filters and
 the smoke command's transformer enable flag, so they affect the config hash and snapshot.

@@ -151,13 +151,17 @@ per-run roots and are not hashed by the current input or artifact manifest. The 
 transformer name/version and inference settings, but exact model-byte provenance must be managed
 separately for transformer research.
 
-In contrast, an enabled generative annotator’s local model directory is hashed as a run input. Its
-logical ID, exact revision, license/terms reference, prompt and schema versions, decoding settings,
-verifier version, optional configured token rates, and `retrospective_parser` status appear in
-annotation provenance. The shared cache is outside the run artifact roots, but every consumed raw
-response is copied to that run’s `models.../llm_annotations/responses/` directory. Per-run generation
-attempts and DecisionRounds also sit under the model run root, so all of them enter the final artifact
-manifest on success.
+In contrast, an enabled generative annotator’s direct local GGUF file is hashed as a run input. The
+exact byte identity is named `model_file_sha256` in annotation rows, the annotation summary, and
+`provenance.json`; each DecisionRound carries the same value as `model.sha256`. Provenance also
+records `backend: llama_cpp_gguf`, the logical ID and exact revision, license/terms reference,
+`llama-cpp-python` version, prompt and schema versions/hashes, the GGUF-embedded chat-template hash,
+decoding and context settings, requested/effective GPU layers, optional configured token rates, and
+`retrospective_parser` status. The shared cache is outside the run artifact roots, but every consumed
+raw response is copied to that run’s `models.../llm_annotations/responses/` directory. Per-run
+generation attempts and DecisionRounds also sit under the model run root, so all of them enter the
+final artifact manifest on success. The GGUF itself is referenced and hashed, not copied into the
+run.
 
 ### Generative semantic/evidence artifacts
 
@@ -182,8 +186,11 @@ grounding. The verifier establishes those deterministic contracts only. It does 
 prose semantically supports a claim or that a mechanism is true.
 
 `prompt.txt` and `schema.json` freeze the exact instruction/output contracts. `provenance.json`
-records model/config/cache/verifier identities, optional configured token rates, and the retrospective
-parsing assumption. Every newly generated response is first written to
+records model/config/cache/verifier identities, `model_file_sha256`, the required embedded-template
+hash, llama.cpp runtime/device settings, optional configured token rates, and the retrospective
+parsing assumption. It explicitly records `mtp_speculative_decoding: false`: the in-process
+`llama_cpp_gguf` backend performs ordinary inference even though the default model name contains
+`MTP`. Every newly generated response is first written to
 `generation_attempts/<cache-key>.json`, before parsing or verification, so malformed/truncated output
 survives a failed run for diagnosis. A successful generated or cache-backed response copied under
 `responses/<cache-key>.json` includes the exact raw generation, parsed annotation payload,
@@ -239,7 +246,8 @@ not an investment recommendation.
 source request. Each record has a SHA-256 `round_id` over its canonical content and includes:
 
 - run/item/source identity, source availability, assigned decision time, and configured horizon;
-- exact model bytes identity, prompt/schema versions and hashes, and greedy sampling settings;
+- `provider: llama_cpp_gguf`, exact model bytes identity (the same value exposed elsewhere as
+  `model_file_sha256`), prompt/schema versions and hashes, and greedy sampling settings;
 - `source_scope: current_source_only` plus every numbered span ID exposed to the model;
 - exact raw generation and strict structured output;
 - every deterministic verifier check and result;

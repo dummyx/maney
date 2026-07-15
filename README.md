@@ -96,8 +96,20 @@ See [Workflows](docs/workflows.md) for all commands and the work each one perfor
 
 ## Optional language-model text analysis
 
-Large language model (LLM) support is off by default and requires a model already stored on the
-machine. Tests do not download one.
+Large language model (LLM) support is off by default. The normal sample and baseline do not install
+an LLM library, download a model, or require PyTorch. The optional runtime is
+`llama-cpp-python==0.3.34`, installed through the separate `llm` extra. It reads one local GGUF
+model file—the format llama.cpp uses—directly from the path you configure. It never downloads a
+model while the pipeline is running.
+
+The bundled settings identify
+`unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL` at revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf` and expect the local file
+`Qwen3.6-27B-UD-Q4_K_XL.gguf`. That file is about 17.9 GB. In practice, use a Mac with at least
+32 GB of unified memory and process one text item at a time; the model file is not the program's
+only memory use. You must download the file explicitly, review its license/terms, and set
+`paths.llm_model`. See [Workflows](docs/workflows.md#optional-local-generative-semanticevidence-annotation)
+for the exact install, download, checksum, configuration, and real-model acceptance commands.
 
 When enabled, the model reads one text item at a time and returns a structured interpretation for
 each company that the program matched in that item. The result includes positive or negative
@@ -118,6 +130,11 @@ The LLM never creates orders. It receives no prices, future outcomes, current si
 web results, or other documents. A modern model may already know facts learned after the historical
 date, so this test cannot show what the same model would have produced at that past date.
 
+The model runs directly on your Mac through llama.cpp. Although its repository name includes `MTP`,
+the current Python path does not use that optional speed-up. Regular automated tests substitute
+fixed model replies to check the surrounding code; only the separate real-model test proves that
+the full model file can load and produce a valid reply on your machine.
+
 For setup and output details, read [Configuration](docs/configuration.md),
 [Features and models](docs/features_and_models.md), and [Outputs](docs/outputs.md).
 
@@ -133,8 +150,8 @@ For setup and output details, read [Configuration](docs/configuration.md),
   available, and when the program could have seen each value.
 - Large runs eventually load intermediate tables into RAM. Start with date, stock symbol, and
   `--limit` filters.
-- Optional language-model tools use local model files only. The default sample does not need
-  PyTorch.
+- Optional language-model tools use local model files only. The default sample needs neither
+  PyTorch nor `llama-cpp-python`.
 - The project does not scrape websites or provide a market-data downloader.
 
 ## Documentation

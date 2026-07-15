@@ -199,12 +199,18 @@ The runtime row limit selects the earliest complete decision timestamps, not raw
 pipeline then fetches the required context around those decisions and keeps all selected assets at
 each timestamp, so development limits do not truncate warm-up history or split cross-sections.
 
-Optional transformer dependencies are isolated behind the `nlp` extra. Device selection is
-centralized: MPS is used when available, otherwise CPU. CUDA is not assumed. The smoke CLI's
+Optional transformer dependencies are isolated behind the `nlp` extra. Their device selection is
+centralized: PyTorch MPS is used when available, otherwise CPU. CUDA is not assumed. The smoke CLI's
 transformer flag is folded into the typed config before run creation, so config hashing and snapshots
 record the enabled state.
 
-The generative annotator uses the same optional dependency/device boundary. Its host constructs one
+The generative annotator has a separate `llm` extra pinned to `llama-cpp-python==0.3.34`; the
+baseline installs neither it nor model weights. Its `llama_cpp_gguf` backend opens one direct local
+GGUF file in-process and makes no runtime network request. Device selection asks the native binding
+for llama.cpp Metal layer offload when supported and otherwise sets GPU layers to zero for CPU. This
+Metal path is distinct from PyTorch MPS.
+
+The generative host constructs one
 source-grounded request per text item from deterministic, historically active asset candidates,
 source-local numbered spans, noisy source type/quality, the configured horizon, and a host-recorded
 safe market decision no earlier than source availability. The model prompt does not receive that
@@ -224,15 +230,24 @@ overwrites conventional sentiment/event fields. Transformer sentiment can coexis
 families then isolate numeric, conventional-text, and LLM feature combinations in one backtest, with
 arithmetic ablation deltas reported separately.
 
-Model loading is local-files-only with remote custom code disabled. The local model directory is a
-hashed run input. Cache keys include exact request/candidate/model-directory and prompt/schema/
-verifier/decoding identity. Every new generation attempt is written before parsing, and every
-consumed successful/cache response is copied under the run model root. One canonical DecisionRound
-per source request records exact output, verifier checks, generated/cache/deduplicated origin, and
-available token/latency/configured-cost usage; the ledger is replay-verified without another model
-call. The source timestamp controls feature availability; annotation-stage completion time is audit
-metadata. Because pretraining may contain later facts, this remains a retrospective parser rather
-than proof of historically deployable inference.
+The bundled logical selector is `unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL`, pinned to revision
+`5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf`; it expects the direct local file
+`Qwen3.6-27B-UD-Q4_K_XL.gguf`. The runtime does not resolve that selector. It hashes the file and, for
+that default selector/revision, requires SHA-256
+`4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095`. It also requires the chat
+template embedded in GGUF metadata and records its hash. The model file is about 17.9 GB, so 32 GB or
+more of unified memory is a practical starting point once context and working buffers are included.
+
+Cache keys include the exact request/candidate, `model_file_sha256`, llama.cpp version and runtime
+settings, and prompt/schema/verifier/decoding identity. Every new generation attempt is written
+before parsing, and every consumed successful/cache response is copied under the run model root. One
+canonical DecisionRound per source request records exact output, verifier checks,
+generated/cache/deduplicated origin, and available token/latency/configured-cost usage; the ledger is
+replay-verified without another model call. The model name contains `MTP`, but the current in-process
+chat-completion call is ordinary inference and records no MTP speculative decoding. The source
+timestamp controls feature availability; annotation-stage completion time is audit metadata. Because
+pretraining may contain later facts, this remains a retrospective parser rather than proof of
+historically deployable inference.
 
 There is no scraping, data-vendor adapter, or autonomous strategy-to-order path. The standalone
 kabuS command group can transmit operator-prepared cash-equity orders, but the pipeline, backtests,

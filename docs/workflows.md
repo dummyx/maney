@@ -215,25 +215,74 @@ text/model identity.
 
 ### Optional local generative semantic/evidence annotation
 
-First edit a copied config: set `paths.llm_model` to an immutable local model directory, fill the
-model ID/revision/license fields, and enable annotation. Keep `feature_mode: sidecar` for the first
-review run:
+This path is separate from the baseline and from the PyTorch `nlp` extra. It uses
+`llama-cpp-python==0.3.34` from the `llm` extra. On Apple Silicon, install it with Metal enabled:
+
+```bash
+CMAKE_ARGS="-DGGML_METAL=on" uv sync --extra llm --locked
+```
+
+This installs/builds the runtime but does not download model weights. The pipeline also never
+downloads weights. After reviewing the model license and confirming that your use is permitted,
+download the pinned file explicitly:
+
+```bash
+uvx --from huggingface-hub hf download \
+  unsloth/Qwen3.6-27B-MTP-GGUF \
+  Qwen3.6-27B-UD-Q4_K_XL.gguf \
+  --revision 5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf \
+  --local-dir /absolute/path/to/qwen-gguf
+```
+
+That command contacts Hugging Face; run it deliberately rather than from a test or pipeline stage.
+The expected file is about 17.9 GB. A Mac with at least 32 GB of unified memory is the practical
+starting point because inference also needs context and working memory. Verify the bytes before use:
+
+```bash
+shasum -a 256 \
+  /absolute/path/to/qwen-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf
+```
+
+Expected SHA-256:
+
+```text
+4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095
+```
+
+Then edit a copied config. `paths.llm_model` is the direct file path, not a directory or model-hub
+selector. Keep `feature_mode: sidecar` for the first review run:
 
 ```yaml
 paths:
-  llm_model: /absolute/path/to/immutable/local-model
+  llm_model: /absolute/path/to/qwen-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf
 llm_annotations:
   enabled: true
   feature_mode: sidecar
-  model_id: local-model-id
-  model_revision: exact-local-revision
-  model_license_or_terms_ref: local-license-record
+  backend: llama_cpp_gguf
+  model_id: unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL
+  model_revision: 5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
+  model_license_or_terms_ref: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/tree/5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
+  batch_size: 1
+  max_input_tokens: 2048
+  max_new_tokens: 384
+  context_tokens: 8192
+  prompt_batch_tokens: 512
+  gpu_layers: -1
+  flash_attention: true
+  use_mmap: true
 ```
+
+`context_tokens` is the total prompt-plus-reply window. `prompt_batch_tokens` is the internal chunk
+used while evaluating a prompt, not a document count. `gpu_layers: -1` asks the native llama.cpp
+binding to offload all possible layers to Metal. A CPU-only binding uses zero GPU layers. Setting
+`gpu_layers: 0` also disables layer offload, but a Metal-enabled build can still initialize its Metal
+backend. If Metal cannot start on the machine, install a CPU-only build as described in
+[Troubleshooting](troubleshooting.md#metal-context-creation-fails). `use_mmap` avoids eagerly copying
+the whole GGUF but does not eliminate its memory needs.
 
 Then generate and inspect only the sidecars:
 
 ```bash
-uv sync --extra nlp
 uv run nlp-trader annotate-text --config configs/local.yaml
 ```
 
@@ -246,6 +295,29 @@ deterministic sample output is unchanged. With sidecar mode above, the stage wri
   failed run for diagnosis;
 - verified per-entity Silver semantic/evidence rows and processing/verification summaries; and
 - `models.../<run_id>/llm_decisions/rounds.jsonl`, which is immediately replayed and verified.
+
+The provenance records `backend: llama_cpp_gguf`, `model_file_sha256`, the
+`llama-cpp-python` version, requested and effective GPU layers, context/runtime settings, and the
+SHA-256 of the chat template embedded in the GGUF. The default model ID/revision is accepted only
+with the exact file checksum above. A missing embedded template or a changed model file fails rather
+than silently changing the prompt format.
+
+The repository/model name contains `MTP`, but this backend calls the ordinary in-process llama.cpp
+chat-completion API. It does not implement or claim MTP speculative-decoding acceleration.
+
+Normal tests use an injected/fake generator. They verify host behavior without loading 17.9 GB of
+weights, so a normal `uv run pytest` does not prove real model inference. After installing the
+`llm` extra and placing the verified file locally, run the explicitly gated acceptance test:
+
+```bash
+NLP_TRADER_RUN_REAL_LLM=1 \
+NLP_TRADER_LLM_MODEL_PATH=/absolute/path/Qwen3.6-27B-UD-Q4_K_XL.gguf \
+uv run pytest tests/acceptance/test_llama_cpp_qwen.py -v
+```
+
+That test is the real local model-load and inference check. It remains opt-in because of the model's
+size, runtime, and licensing requirements; passing it is not evidence of extraction quality or
+trading performance.
 
 The DecisionRound records whether each request was newly generated, a cache hit, or deduplicated. It
 also retains exact output, verifier checks, available token/latency values, and optional configured
@@ -281,8 +353,8 @@ llm_annotations:
 ```
 
 Augmentation adds separate `llm_*` values; it never replaces conventional text sentiment or events.
-Transformer sentiment may coexist. The shared cache is keyed by exact input, candidate,
-model-directory, prompt/schema/verifier, and decoding identity. A complete augment backtest writes the
+Transformer sentiment may coexist. The shared cache is keyed by exact input, candidate, model-file
+SHA-256, llama.cpp/runtime settings, prompt/schema/verifier, and decoding identity. A complete augment backtest writes the
 six family results plus `evaluation/llm_ablation_comparison.json`; its differences are arithmetic
 diagnostics, not a promotion decision.
 
