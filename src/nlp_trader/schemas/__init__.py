@@ -57,10 +57,23 @@ class Asset:
     figi: str | None = None
     isin: str | None = None
     industry: str | None = None
+    short_available: bool = False
+    hard_to_borrow: bool | None = None
+    trading_unit: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("asset_id", "symbol", "exchange", "currency", "name", "sector"):
             _nonempty(getattr(self, name), name)
+        if type(self.short_available) is not bool:
+            raise ValueError("short_available must be a boolean")
+        if self.hard_to_borrow is not None and type(self.hard_to_borrow) is not bool:
+            raise ValueError("hard_to_borrow must be a boolean when supplied")
+        if self.hard_to_borrow is None:
+            object.__setattr__(self, "hard_to_borrow", self.short_available)
+        if self.trading_unit is not None and (
+            type(self.trading_unit) is not int or self.trading_unit < 1
+        ):
+            raise ValueError("trading_unit must be a positive integer when supplied")
         if (
             self.active_from is not None
             and self.active_to is not None
@@ -85,18 +98,38 @@ class MarketBar:
     corporate_action_adjusted: bool
     adjustment_vintage_at: datetime | None = None
     return_adjustment_factor: float = 1.0
+    exchange: str | None = None
+    currency: str | None = None
+    trading_unit: int | None = None
+    session_date: date | None = None
+    available_at: datetime | None = None
+    price_basis: Literal["raw_tradable"] | None = None
 
     def __post_init__(self) -> None:
         for name in ("asset_id", "symbol", "bar_size"):
             _nonempty(getattr(self, name), name)
         _aware(self.ts, "ts")
+        for name in ("exchange", "currency"):
+            value = getattr(self, name)
+            if value is not None:
+                _nonempty(value, name)
+        if self.trading_unit is not None and (
+            type(self.trading_unit) is not int or self.trading_unit < 1
+        ):
+            raise ValueError("trading_unit must be a positive integer when supplied")
+        if self.available_at is not None:
+            _aware(self.available_at, "available_at")
+        if self.price_basis is not None and self.price_basis != "raw_tradable":
+            raise ValueError("price_basis must be raw_tradable when supplied")
         if self.adjustment_vintage_at is not None:
             _aware(self.adjustment_vintage_at, "adjustment_vintage_at")
         if self.corporate_action_adjusted:
             if self.adjustment_vintage_at is None:
                 raise ValueError("corporate-action-adjusted OHLC requires adjustment_vintage_at")
-            if self.adjustment_vintage_at > self.ts:
+            if self.adjustment_vintage_at > self.ts and self.available_at is None:
                 raise ValueError("adjustment_vintage_at must not be after the bar timestamp")
+            if self.available_at is not None and self.adjustment_vintage_at > self.available_at:
+                raise ValueError("adjustment_vintage_at must not be after available_at")
         _finite(self.return_adjustment_factor, "return_adjustment_factor")
         if self.return_adjustment_factor <= 0:
             raise ValueError("return_adjustment_factor must be positive")

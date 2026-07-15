@@ -7,6 +7,8 @@ import pytest
 from nlp_trader.backtest.costs import CostModel, transaction_cost_return
 from nlp_trader.backtest.engine import run_backtest
 from nlp_trader.config import BacktestConfig
+from nlp_trader.portfolio.constraints import constraints_from_config, round_trip_entry_constraints
+from nlp_trader.portfolio.construction import construct_portfolio
 
 
 def _config(*, shorts: bool = False, borrow_bps: float = 0.0) -> BacktestConfig:
@@ -37,6 +39,23 @@ def _execution_fields(index: int) -> dict[str, float | str]:
         "execution_dollar_volume": 100_000_000.0,
         "exit_dollar_volume": 100_000_000.0,
     }
+
+
+def test_round_trip_entry_constraints_have_explicit_horizon_formulas() -> None:
+    config = _config()
+    base = constraints_from_config(config)
+    one_session = round_trip_entry_constraints(config, horizon_steps=1)
+    multi_session = round_trip_entry_constraints(config, horizon_steps=2)
+
+    assert one_session.max_daily_turnover == pytest.approx(
+        config.max_daily_turnover / (2.0 + config.same_day_exit_notional_buffer)
+    )
+    assert one_session.max_participation_rate == pytest.approx(
+        config.max_participation_rate / (1.0 + config.same_day_exit_notional_buffer)
+    )
+    assert multi_session == base
+    with pytest.raises(ValueError, match="horizon_steps"):
+        round_trip_entry_constraints(config, horizon_steps=0)
 
 
 def test_costs_increase_with_volatility_participation_and_borrow() -> None:
@@ -80,6 +99,50 @@ def test_backtest_uses_conservative_missing_risk_estimates() -> None:
     assert entry["target_weight"] <= 0.1 + 1e-12
     assert "missing_beta_conservative_fallback" in entry["risk_flags"]
     assert "missing_volatility_conservative_fallback" in entry["risk_flags"]
+
+
+def test_backtest_uses_the_same_top_k_selection_as_portfolio_construction() -> None:
+    predictions = [
+        {
+            "asset_id": asset_id,
+            "symbol": asset_id.upper(),
+            "asof_ts": "2026-07-01T20:00:00Z",
+            "horizon": "1d",
+            "score": score,
+            "close": 10.0,
+            "dollar_volume": 100_000_000.0,
+            "sector": "Mixed",
+            "beta": 0.0,
+            "volatility": 0.01,
+        }
+        for asset_id, score in (("a", 0.9), ("b", 0.5), ("c", 0.1))
+    ]
+    labels = [
+        {
+            **{key: row[key] for key in ("asset_id", "symbol", "asof_ts", "horizon")},
+            "forward_return": 0.01,
+            **_execution_fields(0),
+        }
+        for row in predictions
+    ]
+
+    result = run_backtest(predictions, labels, _config(), top_k=1)
+    entries = [
+        trade for trade in result["trades"] if trade["execution_phase"] == "entry_next_session_open"
+    ]
+    paper_decision = construct_portfolio(
+        predictions,
+        {},
+        round_trip_entry_constraints(_config(), horizon_steps=1),
+        equity=_config().initial_capital,
+        top_k=1,
+    )
+
+    assert [trade["asset_id"] for trade in entries] == ["a"]
+    assert {trade["asset_id"]: trade["target_weight"] for trade in entries} == (
+        paper_decision.target_weights
+    )
+    assert result["assumptions"]["top_k"] == 1
 
 
 def test_backtest_enforces_participation_and_logs_drift_and_metrics() -> None:
@@ -243,9 +306,62 @@ def test_multi_day_labels_are_replayed_without_overlap() -> None:
     ]
 
     result = run_backtest(predictions, labels, _config())
+    offset = run_backtest(predictions, labels, _config(), rebalance_offset=1)
 
     assert result["metrics"]["periods"] == 2
     assert result["assumptions"]["overlapping_labels"].startswith("multi-session")
+    assert [row["asof_ts"] for row in offset["periods"]] == [
+        predictions[1]["asof_ts"],
+        predictions[3]["asof_ts"],
+    ]
+    with pytest.raises(ValueError, match="rebalance_offset"):
+        run_backtest(predictions, labels, _config(), rebalance_offset=2)
+
+
+def test_split_multi_day_replay_preserves_the_global_rebalance_phase() -> None:
+    predictions = [
+        {
+            "asset_id": "a",
+            "symbol": "A",
+            "asof_ts": f"2026-07-{day:02d}T20:00:00Z",
+            "horizon": "3d",
+            "score": 1.0,
+            "close": 10.0,
+            "dollar_volume": 100_000_000.0,
+        }
+        for day in range(1, 9)
+    ]
+    labels = [
+        {
+            "asset_id": "a",
+            "symbol": "A",
+            "asof_ts": row["asof_ts"],
+            "horizon": "3d",
+            "forward_return": 0.03,
+            "label_start_ts": f"2026-07-{day + 1:02d}T13:30:00Z",
+            "label_end_ts": f"2026-07-{day + 3:02d}T20:00:00Z",
+            "execution_price": 10.0,
+            "exit_price": 10.3,
+            "execution_dollar_volume": 100_000_000.0,
+            "exit_dollar_volume": 100_000_000.0,
+        }
+        for day, row in enumerate(predictions, start=1)
+    ]
+
+    unsplit = run_backtest(predictions, labels, _config())
+    pre_holdout_periods = 5
+    development = run_backtest(predictions[:pre_holdout_periods], labels, _config())
+    holdout = run_backtest(
+        predictions[pre_holdout_periods:],
+        labels,
+        _config(),
+        rebalance_offset=(-pre_holdout_periods) % 3,
+    )
+
+    unsplit_times = [row["asof_ts"] for row in unsplit["periods"]]
+    split_times = [row["asof_ts"] for row in development["periods"] + holdout["periods"]]
+    assert split_times == unsplit_times
+    assert development["periods"][-1]["exit_ts"] < holdout["periods"][0]["execution_ts"]
 
 
 def test_backtest_never_selects_assets_by_partial_future_label_coverage() -> None:

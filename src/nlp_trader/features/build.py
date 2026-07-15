@@ -6,11 +6,16 @@ import statistics
 from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from nlp_trader.calendars import USEquityCalendar
 from nlp_trader.config import ResearchConfig
+from nlp_trader.market_timing import (
+    market_bar_available_at,
+    market_decision_time_for_bar,
+    market_decision_times_by_session,
+)
 from nlp_trader.schemas import (
     Asset,
     CorporateAction,
@@ -56,12 +61,12 @@ def _price_series(bars: list[MarketBar]) -> tuple[list[float], str]:
     if any(
         not bar.corporate_action_adjusted
         or bar.adjustment_vintage_at is None
-        or bar.adjustment_vintage_at > bar.ts
+        or bar.adjustment_vintage_at > market_bar_available_at(bar)
         for bar in bars
     ):
         raise ValueError(
             "daily baseline requires point-in-time corporate-action-adjusted OHLC with "
-            "adjustment_vintage_at <= ts for every bar"
+            "adjustment_vintage_at <= market availability for every bar"
         )
     return [
         bar.close * bar.return_adjustment_factor for bar in bars
@@ -123,12 +128,13 @@ def _daily_bar_calendar(
         )
     if any(bar.ts.tzinfo is None for bar in bars):
         raise ValueError("daily market-bar timestamps must be timezone-aware")
-    dates = [bar.ts.astimezone(UTC).date() for bar in bars]
+    session_dates = [bar.ts.astimezone(UTC).date() for bar in bars]
+    availability_dates = [market_bar_available_at(bar).date() for bar in bars]
     padding_days = max(14, config.features.horizon_days * 4 + 14)
     calendar = USEquityCalendar(
         calendar_name=config.data.calendar,
-        start=min(dates) - timedelta(days=14),
-        end=max(dates) + timedelta(days=padding_days),
+        start=min(session_dates) - timedelta(days=14),
+        end=max(max(session_dates), max(availability_dates)) + timedelta(days=padding_days),
     )
     for bar in bars:
         session_date = bar.ts.astimezone(calendar.timezone).date()
@@ -146,17 +152,24 @@ def _daily_bar_calendar(
     return calendar
 
 
-def _next_sessions(
+def _label_session_closes(
     calendar: USEquityCalendar,
-    after: datetime,
+    asof_ts: datetime,
     count: int,
-) -> tuple[datetime, ...]:
-    session_date = after.astimezone(calendar.timezone).date()
+) -> tuple[datetime, tuple[datetime, ...]]:
+    """Return the first strictly future open and its inclusive horizon closes."""
+
+    entry_open = calendar.next_open_decision_time(asof_ts)
+    if entry_open <= asof_ts.astimezone(UTC):
+        entry_date = entry_open.astimezone(calendar.timezone).date()
+        entry_open = calendar.session_open(calendar.next_session(entry_date))
+    session_date = entry_open.astimezone(calendar.timezone).date()
     values: list[datetime] = []
-    for _ in range(count):
-        session_date = calendar.next_session(session_date)
+    for index in range(count):
         values.append(calendar.session_close(session_date))
-    return tuple(values)
+        if index + 1 < count:
+            session_date = calendar.next_session(session_date)
+    return entry_open, tuple(values)
 
 
 def _validate_contiguous_sessions(
@@ -179,18 +192,29 @@ def _validate_contiguous_sessions(
             )
 
 
-def _validate_asset_bar_contracts(
-    bars: list[MarketBar],
-    assets: list[Asset],
-    calendar: USEquityCalendar,
-) -> None:
-    if not assets:
-        return
+def _index_assets(assets: list[Asset]) -> dict[str, Asset]:
     assets_by_id: dict[str, Asset] = {}
     for master_asset in assets:
         if master_asset.asset_id in assets_by_id:
             raise ValueError(f"duplicate asset_id in asset master: {master_asset.asset_id}")
         assets_by_id[master_asset.asset_id] = master_asset
+    return assets_by_id
+
+
+def _asset_is_active(asset: Asset, session_date: date) -> bool:
+    return (asset.active_from is None or session_date >= asset.active_from) and (
+        asset.active_to is None or session_date <= asset.active_to
+    )
+
+
+def _validate_asset_bar_contracts(
+    bars: list[MarketBar],
+    assets_by_id: dict[str, Asset],
+    calendar: USEquityCalendar,
+) -> None:
+    if not assets_by_id:
+        return
+    asset_ids_by_session: dict[date, set[str]] = defaultdict(set)
     for bar in bars:
         asset = assets_by_id.get(bar.asset_id)
         if asset is None:
@@ -205,6 +229,24 @@ def _validate_asset_bar_contracts(
             raise ValueError(f"market bar for {bar.asset_id} predates active_from")
         if asset.active_to is not None and session_date > asset.active_to:
             raise ValueError(f"market bar for {bar.asset_id} is after active_to")
+        asset_ids_by_session[session_date].add(bar.asset_id)
+
+    if not asset_ids_by_session:
+        return
+    first_session = min(asset_ids_by_session)
+    last_session = max(asset_ids_by_session)
+    for session_date in calendar.sessions(first_session, last_session):
+        expected = {
+            asset_id
+            for asset_id, asset in assets_by_id.items()
+            if _asset_is_active(asset, session_date)
+        }
+        missing = sorted(expected - asset_ids_by_session.get(session_date, set()))
+        if missing:
+            raise ValueError(
+                "missing active asset market bars for exchange session "
+                f"{session_date.isoformat()}: {', '.join(missing)}"
+            )
 
 
 def _market_returns(
@@ -367,14 +409,16 @@ def _first_numeric(values: Mapping[str, Any], names: tuple[str, ...]) -> float |
 def _populate_known_point_in_time_context(
     row: dict[str, Any],
     bar: MarketBar,
+    asof_ts: datetime,
     fundamentals: list[FundamentalRecord],
     earnings_events: list[EarningsCalendarEvent],
     corporate_actions: list[CorporateAction],
 ) -> None:
+    session_date = bar.session_date or bar.ts.date()
     known_fundamentals = [
         record
         for record in fundamentals
-        if record.available_at <= bar.ts and record.period_end <= bar.ts.date()
+        if record.available_at <= asof_ts and record.period_end <= session_date
     ]
     if known_fundamentals:
         latest = max(
@@ -400,11 +444,11 @@ def _populate_known_point_in_time_context(
     known_earnings = [
         event
         for event in earnings_events
-        if event.available_at <= bar.ts and event.event_ts > bar.ts
+        if event.available_at <= asof_ts and event.event_ts > asof_ts
     ]
     if known_earnings:
         event = min(known_earnings, key=lambda value: value.event_ts)
-        proximity = (event.event_ts - bar.ts).total_seconds() / 86_400.0
+        proximity = (event.event_ts - asof_ts).total_seconds() / 86_400.0
         row["earnings_proximity_days"] = proximity
         row["earnings_proximity_missing"] = False
         row["earnings_calendar_available_at"] = format_utc(event.available_at)
@@ -413,13 +457,13 @@ def _populate_known_point_in_time_context(
     known_dividends = [
         action
         for action in corporate_actions
-        if action.available_at <= bar.ts
-        and action.event_ts > bar.ts
+        if action.available_at <= asof_ts
+        and action.event_ts > asof_ts
         and action.action_type.casefold() in {"dividend", "ex_dividend", "cash_dividend"}
     ]
     if known_dividends:
         action = min(known_dividends, key=lambda value: value.event_ts)
-        proximity = (action.event_ts - bar.ts).total_seconds() / 86_400.0
+        proximity = (action.event_ts - asof_ts).total_seconds() / 86_400.0
         row["ex_dividend_proximity_days"] = proximity
         row["ex_dividend_proximity_missing"] = False
         row["corporate_action_available_at"] = format_utc(action.available_at)
@@ -464,6 +508,10 @@ def _empty_text_features(
         "text_decay_weight_sum",
     )
     row[f"text_count_{prefix}"] = 0
+    row[f"raw_text_count_{prefix}"] = 0
+    row[f"raw_attention_item_count_{prefix}"] = 0
+    row[f"raw_mention_velocity_{prefix}"] = 0.0
+    row[f"raw_attention_abnormal_{prefix}"] = 0.0
     row[f"text_missing_{prefix}"] = True
     row[f"latest_text_available_at_{prefix}"] = None
     row[f"latest_text_age_hours_{prefix}"] = None
@@ -498,6 +546,54 @@ def _signal_actionable_at(signal: TextSignal) -> datetime:
     return max(signal.asof_ts, _signal_available_at(signal))
 
 
+def _populate_raw_text_diagnostics(
+    row: dict[str, Any],
+    raw_window: list[TextSignal],
+    days: int,
+    prefix: str,
+    raw_prior_count: int,
+) -> None:
+    """Retain copy volume under explicit raw names without treating it as evidence."""
+
+    row[f"raw_text_count_{prefix}"] = len(raw_window)
+    row[f"raw_attention_item_count_{prefix}"] = len(raw_window)
+    row[f"raw_mention_velocity_{prefix}"] = len(raw_window) / float(days)
+    row[f"raw_attention_abnormal_{prefix}"] = (
+        len(raw_window) / raw_prior_count if raw_prior_count else float(len(raw_window))
+    )
+    row[f"novelty_share_{prefix}"] = statistics.fmean(signal.novelty for signal in raw_window)
+    row[f"novel_item_count_{prefix}"] = sum(signal.novelty > 0.5 for signal in raw_window)
+    row[f"duplicate_item_count_{prefix}"] = sum(signal.novelty <= 0.5 for signal in raw_window)
+
+
+def _populate_independent_text_diagnostics(
+    row: dict[str, Any],
+    window: list[TextSignal],
+    asof_ts: datetime,
+    days: int,
+    prefix: str,
+    prior_count: int,
+) -> None:
+    """Populate model-facing counts and timing from novelty-filtered evidence."""
+
+    latest = max(_signal_available_at(signal) for signal in window)
+    row[f"text_count_{prefix}"] = len(window)
+    row[f"text_missing_{prefix}"] = False
+    row[f"latest_text_available_at_{prefix}"] = format_utc(latest)
+    row[f"latest_text_age_hours_{prefix}"] = (asof_ts - latest).total_seconds() / 3600.0
+    row[f"time_since_first_seen_hours_{prefix}"] = (
+        asof_ts - min(_signal_available_at(signal) for signal in window)
+    ).total_seconds() / 3600.0
+    row[f"attention_item_count_{prefix}"] = len(window)
+    row[f"attention_unique_item_count_{prefix}"] = len({signal.item_id for signal in window})
+    row[f"attention_mention_velocity_{prefix}"] = len(window) / float(days)
+    row[f"attention_abnormal_{prefix}"] = (
+        len(window) / prior_count if prior_count else float(len(window))
+    )
+    row[f"mention_velocity_{prefix}"] = row[f"attention_mention_velocity_{prefix}"]
+    row[f"abnormal_mention_volume_{prefix}"] = row[f"attention_abnormal_{prefix}"]
+
+
 def _populate_text_features(
     row: dict[str, Any],
     signals: list[TextSignal],
@@ -516,13 +612,28 @@ def _populate_text_features(
     start = asof_ts - timedelta(days=days)
     window_start = bisect_right(availability_times, start)
     window_end = bisect_right(availability_times, asof_ts)
-    window = [
+    raw_window = [
         signal
         for signal in signals[window_start:window_end]
         if _signal_actionable_at(signal) <= asof_ts
     ]
+    if not raw_window:
+        _empty_text_features(row, prefix, event_types, source_types, decay_half_life_days)
+        return
+    prior_start = start - timedelta(days=days)
+    prior_window_start = bisect_right(availability_times, prior_start)
+    prior_window_end = bisect_right(availability_times, start)
+    raw_prior_window = [
+        signal
+        for signal in signals[prior_window_start:prior_window_end]
+        if _signal_actionable_at(signal) <= asof_ts
+    ]
+    raw_prior_count = len(raw_prior_window)
+    prior_count = sum(signal.novelty > 0.5 for signal in raw_prior_window)
+    window = [signal for signal in raw_window if signal.novelty > 0.5]
     if not window:
         _empty_text_features(row, prefix, event_types, source_types, decay_half_life_days)
+        _populate_raw_text_diagnostics(row, raw_window, days, prefix, raw_prior_count)
         return
 
     scores = [signal.sentiment_score for signal in window]
@@ -555,7 +666,6 @@ def _populate_text_features(
     ]
     positive_count = sum(score > 0.05 for score in scores)
     negative_count = sum(score < -0.05 for score in scores)
-    latest = max(_signal_available_at(signal) for signal in window)
     recent_start = asof_ts - timedelta(days=days / 2.0)
     recent_scores = [
         signal.sentiment_score for signal in window if _signal_available_at(signal) > recent_start
@@ -563,22 +673,10 @@ def _populate_text_features(
     earlier_scores = [
         signal.sentiment_score for signal in window if _signal_available_at(signal) <= recent_start
     ]
-    prior_start = start - timedelta(days=days)
-    prior_window_start = bisect_right(availability_times, prior_start)
-    prior_window_end = bisect_right(availability_times, start)
-    prior_count = sum(
-        _signal_actionable_at(signal) <= asof_ts
-        for signal in signals[prior_window_start:prior_window_end]
-    )
     event_window = [signal for signal in window if signal.event_type]
 
-    row[f"text_count_{prefix}"] = len(window)
-    row[f"text_missing_{prefix}"] = False
-    row[f"latest_text_available_at_{prefix}"] = format_utc(latest)
-    row[f"latest_text_age_hours_{prefix}"] = (asof_ts - latest).total_seconds() / 3600.0
-    row[f"time_since_first_seen_hours_{prefix}"] = (
-        asof_ts - min(_signal_available_at(signal) for signal in window)
-    ).total_seconds() / 3600.0
+    _populate_raw_text_diagnostics(row, raw_window, days, prefix, raw_prior_count)
+    _populate_independent_text_diagnostics(row, window, asof_ts, days, prefix, prior_count)
     sources = {signal.source for signal in window if signal.source}
     authors = {signal.author_hash for signal in window if signal.author_hash}
     author_groups: dict[str, list[float]] = defaultdict(list)
@@ -632,17 +730,6 @@ def _populate_text_features(
         else 0.0
     )
 
-    row[f"attention_item_count_{prefix}"] = len(window)
-    row[f"attention_unique_item_count_{prefix}"] = len({signal.item_id for signal in window})
-    row[f"attention_mention_velocity_{prefix}"] = len(window) / float(days)
-    row[f"attention_abnormal_{prefix}"] = (
-        len(window) / prior_count if prior_count else float(len(window))
-    )
-    row[f"mention_velocity_{prefix}"] = row[f"attention_mention_velocity_{prefix}"]
-    row[f"abnormal_mention_volume_{prefix}"] = row[f"attention_abnormal_{prefix}"]
-    row[f"novelty_share_{prefix}"] = statistics.fmean(signal.novelty for signal in window)
-    row[f"novel_item_count_{prefix}"] = sum(signal.novelty > 0.5 for signal in window)
-    row[f"duplicate_item_count_{prefix}"] = sum(signal.novelty <= 0.5 for signal in window)
     row[f"source_credibility_mean_{prefix}"] = statistics.fmean(
         signal.source_credibility for signal in window
     )
@@ -687,9 +774,15 @@ def build_feature_rows(
 
     bar_list = list(bars)
     asset_list = list(assets or [])
+    assets_by_id = _index_assets(asset_list)
     calendar = _daily_bar_calendar(bar_list, config)
+    decision_times_by_session = (
+        market_decision_times_by_session(bar_list, calendar.timezone)
+        if calendar is not None
+        else {}
+    )
     if calendar is not None:
-        _validate_asset_bar_contracts(bar_list, asset_list, calendar)
+        _validate_asset_bar_contracts(bar_list, assets_by_id, calendar)
     bars_by_asset: dict[str, list[MarketBar]] = defaultdict(list)
     signals_by_asset: dict[str, list[TextSignal]] = defaultdict(list)
     for bar in bar_list:
@@ -704,7 +797,7 @@ def build_feature_rows(
         earnings_by_asset[event.asset_id].append(event)
     for action in corporate_actions:
         actions_by_asset[action.asset_id].append(action)
-    sectors_by_asset = {asset.asset_id: asset.sector for asset in asset_list}
+    sectors_by_asset = {asset_id: asset.sector for asset_id, asset in assets_by_id.items()}
     for signal in signal_list:
         signals_by_asset[signal.asset_id].append(signal)
 
@@ -729,15 +822,31 @@ def build_feature_rows(
         asset_signals = sorted(signals_by_asset.get(asset_id, []), key=_signal_available_at)
         availability_times = [_signal_available_at(signal) for signal in asset_signals]
         prices = prices_by_asset[asset_id]
+        master_asset = assets_by_id.get(asset_id)
         for index, bar in enumerate(asset_bars):
+            if calendar is None:
+                continue
+            decision_ts = market_decision_time_for_bar(
+                bar,
+                decision_times_by_session,
+                calendar.timezone,
+            )
+            adjustment_available_at = bar.adjustment_vintage_at
+            if adjustment_available_at is None:
+                raise ValueError("market bar adjustment_vintage_at is required")
             row: dict[str, Any] = {
                 "asset_id": bar.asset_id,
                 "symbol": bar.symbol,
-                "asof_ts": format_utc(bar.ts),
+                "asof_ts": format_utc(decision_ts),
                 "horizon": f"{config.features.horizon_days}d",
                 "feature_set_version": config.features.feature_set_version,
                 "close": bar.close,
                 "price_basis": price_basis_by_asset[asset_id],
+                "session_close_ts": format_utc(bar.ts),
+                "market_bar_available_at": format_utc(market_bar_available_at(bar)),
+                "adjustment_available_at": format_utc(adjustment_available_at),
+                "short_available": master_asset.short_available if master_asset else False,
+                "hard_to_borrow": master_asset.hard_to_borrow if master_asset else False,
             }
             _populate_traditional_features(
                 row,
@@ -751,6 +860,7 @@ def build_feature_rows(
             _populate_known_point_in_time_context(
                 row,
                 bar,
+                decision_ts,
                 fundamentals_by_asset.get(asset_id, []),
                 earnings_by_asset.get(asset_id, []),
                 actions_by_asset.get(asset_id, []),
@@ -759,7 +869,7 @@ def build_feature_rows(
                 _populate_text_features(
                     row,
                     asset_signals,
-                    bar.ts,
+                    decision_ts,
                     days,
                     event_types,
                     source_types,
@@ -804,11 +914,17 @@ def build_label_rows(
 
     bar_list = list(bars)
     asset_list = list(assets or [])
+    assets_by_id = _index_assets(asset_list)
     calendar = _daily_bar_calendar(bar_list, config)
+    decision_times_by_session = (
+        market_decision_times_by_session(bar_list, calendar.timezone)
+        if calendar is not None
+        else {}
+    )
     bars_by_asset: dict[str, list[MarketBar]] = defaultdict(list)
     if calendar is not None:
-        _validate_asset_bar_contracts(bar_list, asset_list, calendar)
-    sectors_by_asset = {asset.asset_id: asset.sector for asset in asset_list}
+        _validate_asset_bar_contracts(bar_list, assets_by_id, calendar)
+    sectors_by_asset = {asset_id: asset.sector for asset_id, asset in assets_by_id.items()}
     for bar in bar_list:
         bars_by_asset[bar.asset_id].append(bar)
 
@@ -823,7 +939,16 @@ def build_label_rows(
         positions_by_close = {bar.ts.astimezone(UTC): index for index, bar in enumerate(asset_bars)}
         prices, price_basis = _price_series(asset_bars)
         for bar in asset_bars:
-            expected_closes = _next_sessions(calendar, bar.ts, horizon)
+            decision_ts = market_decision_time_for_bar(
+                bar,
+                decision_times_by_session,
+                calendar.timezone,
+            )
+            expected_label_start, expected_closes = _label_session_closes(
+                calendar,
+                decision_ts,
+                horizon,
+            )
             future_positions = [positions_by_close.get(value) for value in expected_closes]
             complete = all(position is not None for position in future_positions)
             if complete:
@@ -863,12 +988,15 @@ def build_label_rows(
                 forward_volume_change: float | None = _return(
                     future_average_volume, float(bar.volume)
                 )
-                label_start_ts: str | None = format_utc(
-                    calendar.session_open(
-                        asset_bars[entry_position].ts.astimezone(calendar.timezone).date()
+                label_start_ts: str | None = format_utc(expected_label_start)
+                label_end_ts: str | None = format_utc(asset_bars[target_position].ts)
+                label_available_at: str | None = format_utc(
+                    market_decision_time_for_bar(
+                        exit_bar,
+                        decision_times_by_session,
+                        calendar.timezone,
                     )
                 )
-                label_end_ts: str | None = format_utc(asset_bars[target_position].ts)
                 label_missing_reason: str | None = None
             else:
                 forward_return = None
@@ -877,6 +1005,7 @@ def build_label_rows(
                 forward_volume_change = None
                 label_start_ts = None
                 label_end_ts = None
+                label_available_at = None
                 entry_price = None
                 exit_price = None
                 execution_dollar_volume = None
@@ -885,16 +1014,15 @@ def build_label_rows(
             row: dict[str, Any] = {
                 "asset_id": asset_id,
                 "symbol": bar.symbol,
-                "asof_ts": format_utc(bar.ts),
+                "asof_ts": format_utc(decision_ts),
                 "horizon": suffix,
                 "label_version": config.features.label_version,
                 "sector": sectors_by_asset.get(asset_id),
                 "price_basis": price_basis,
                 "label_start_ts": label_start_ts,
                 "label_end_ts": label_end_ts,
-                "expected_label_start_ts": format_utc(
-                    calendar.session_open(expected_closes[0].astimezone(calendar.timezone).date())
-                ),
+                "label_available_at": label_available_at,
+                "expected_label_start_ts": format_utc(expected_label_start),
                 "expected_label_end_ts": format_utc(expected_closes[-1]),
                 "label_missing_reason": label_missing_reason,
                 "execution_price": entry_price,

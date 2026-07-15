@@ -13,6 +13,15 @@ import polars as pl
 
 from nlp_trader.calendars import USEquityCalendar
 from nlp_trader.config import BacktestConfig
+from nlp_trader.data.japan import (
+    JAPAN_CASH_EQUITY_CONTRACT,
+    MarketContract,
+    strict_integer,
+    validate_japan_asset_record,
+    validate_japan_assets,
+    validate_japan_bar_record,
+    validate_japan_market_dataset,
+)
 from nlp_trader.data.local import canonical_text_hash
 from nlp_trader.schemas import (
     Asset,
@@ -134,6 +143,9 @@ class BacktestEngine(Protocol):
         predictions: list[dict[str, Any]],
         labels: list[dict[str, Any]],
         config: BacktestConfig,
+        *,
+        top_k: int | None = None,
+        rebalance_offset: int = 0,
     ) -> dict[str, Any]: ...
 
     def summarize(self, result: Mapping[str, Any]) -> dict[str, Any]: ...
@@ -171,6 +183,24 @@ def read_local_records(path: Path) -> list[Record]:
     raise ValueError(f"unsupported local data format: {path.suffix or '<none>'}")
 
 
+def _lazy_local_scan(path: Path) -> pl.LazyFrame | None:
+    suffix = path.suffix.casefold()
+    if path.is_dir():
+        parquet_files = tuple(path.rglob("*.parquet"))
+        if not parquet_files:
+            raise ValueError(f"local data directory contains no Parquet files: {path}")
+        return pl.scan_parquet(str(path / "**" / "*.parquet"))
+    if suffix == ".parquet":
+        return pl.scan_parquet(str(path))
+    if suffix == ".csv":
+        return pl.scan_csv(path, infer_schema=False)
+    if suffix == ".jsonl":
+        if path.stat().st_size == 0:
+            return None
+        return pl.scan_ndjson(path)
+    return None
+
+
 def read_filtered_local_records(
     path: Path,
     *,
@@ -186,21 +216,7 @@ def read_filtered_local_records(
 
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
-    suffix = path.suffix.casefold()
-    lazy: pl.LazyFrame | None = None
-    if path.is_dir():
-        parquet_files = tuple(path.rglob("*.parquet"))
-        if not parquet_files:
-            raise ValueError(f"local data directory contains no Parquet files: {path}")
-        source = str(path / "**" / "*.parquet")
-        lazy = pl.scan_parquet(source)
-    elif suffix == ".parquet":
-        source = str(path)
-        lazy = pl.scan_parquet(source)
-    elif suffix == ".csv":
-        lazy = pl.scan_csv(path, infer_schema=False)
-    elif suffix == ".jsonl":
-        lazy = pl.scan_ndjson(path)
+    lazy = _lazy_local_scan(path)
     if lazy is None:
         records = read_local_records(path)
         records = _filter_materialized(
@@ -289,6 +305,82 @@ def _filter_materialized(
     return selected
 
 
+def _japan_market_decision_times(
+    path: Path,
+    *,
+    symbols: Sequence[str] | None,
+    bar_size: str,
+    start: datetime | None,
+    end: datetime | None,
+    limit: int | None,
+) -> tuple[datetime, ...]:
+    """Aggregate complete-session availability with projection pushdown."""
+
+    if limit == 0:
+        return ()
+    lazy = _lazy_local_scan(path)
+    if lazy is None:
+        records = read_filtered_local_records(
+            path,
+            equals={
+                **({"symbol": symbols} if symbols is not None else {}),
+                "bar_size": bar_size,
+            },
+            select_fields=("session_date", "available_at"),
+        )
+        grouped: dict[date, datetime] = {}
+        for record in records:
+            session_date = _date(_required(record, "session_date"), "session_date")
+            available_at = _datetime(_required(record, "available_at"), "available_at")
+            grouped[session_date] = max(grouped.get(session_date, available_at), available_at)
+        pairs = sorted(grouped.items())
+    else:
+        schema = lazy.collect_schema()
+        required = ("symbol", "bar_size", "session_date", "available_at")
+        missing = [field for field in required if field not in schema]
+        if missing:
+            raise ValueError(f"missing selected fields {missing} in {path}")
+        if symbols is not None:
+            lazy = lazy.filter(pl.col("symbol").cast(pl.String).is_in(list(symbols)))
+        lazy = lazy.filter(pl.col("bar_size").cast(pl.String) == bar_size)
+        if schema["available_at"] == pl.String:
+            lazy = lazy.with_columns(
+                pl.col("available_at")
+                .str.to_datetime(time_zone="UTC", strict=True)
+                .alias("available_at")
+            )
+        grouped_rows = (
+            lazy.select("session_date", "available_at")
+            .group_by("session_date")
+            .agg(pl.col("available_at").max().alias("decision_time"))
+            .sort("session_date")
+            .collect(engine="streaming")
+            .to_dicts()
+        )
+        pairs = [
+            (
+                _date(row["session_date"], "session_date"),
+                _datetime(row["decision_time"], "decision_time"),
+            )
+            for row in grouped_rows
+        ]
+
+    selected: list[datetime] = []
+    previous: datetime | None = None
+    for session_date, decision_time in pairs:
+        if previous is not None and decision_time <= previous:
+            raise ValueError(
+                "market session decision times must be strictly increasing; "
+                f"{session_date.isoformat()} resolves to {decision_time.isoformat()}"
+            )
+        previous = decision_time
+        if _in_range(decision_time, start, end):
+            selected.append(decision_time)
+            if limit is not None and len(selected) >= limit:
+                break
+    return tuple(selected)
+
+
 def _mapping(value: object, path: Path) -> Record:
     if not isinstance(value, Mapping):
         raise ValueError(f"expected object record in {path}")
@@ -334,6 +426,12 @@ def _optional_float(value: object) -> float | None:
     return None if value is None or value == "" else float(str(value))
 
 
+def _optional_int(value: object, field_name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    return strict_integer(value, field_name, minimum=1)
+
+
 def _datetime(value: object, field_name: str) -> datetime:
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -359,6 +457,20 @@ def _date(value: object, field_name: str) -> date:
     return parsed
 
 
+def _optional_date(value: object, field_name: str) -> date | None:
+    if value is None or value == "":
+        return None
+    return _date(value, field_name)
+
+
+def _optional_raw_price_basis(value: object) -> Literal["raw_tradable"] | None:
+    if value is None or value == "":
+        return None
+    if value != "raw_tradable":
+        raise ValueError("price_basis must be raw_tradable")
+    return "raw_tradable"
+
+
 def _bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -368,6 +480,10 @@ def _bool(value: object) -> bool:
     if normalized in {"false", "0", "no"}:
         return False
     raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def _optional_bool(value: object, *, default: bool = False) -> bool:
+    return default if value in (None, "") else _bool(value)
 
 
 def _in_range(value: datetime, start: datetime | None, end: datetime | None) -> bool:
@@ -380,17 +496,28 @@ class LocalMarketDataProvider:
         assets_path: Path,
         bars_path: Path,
         corporate_actions_path: Path | None = None,
+        *,
+        market_contract: MarketContract = "generic",
     ) -> None:
+        if market_contract not in {"generic", JAPAN_CASH_EQUITY_CONTRACT}:
+            raise ValueError(f"unsupported market_contract: {market_contract}")
         self.assets_path = assets_path
         self.bars_path = bars_path
         self.corporate_actions_path = corporate_actions_path
+        self.market_contract = market_contract
 
     def fetch_assets(self, *, symbols: Sequence[str] | None = None) -> list[Asset]:
         records = read_filtered_local_records(
             self.assets_path,
             equals={"symbol": symbols} if symbols is not None else None,
         )
-        return [self._asset(record) for record in records]
+        if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT:
+            for record in records:
+                validate_japan_asset_record(record)
+        assets = [self._asset(record) for record in records]
+        if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT:
+            validate_japan_assets(assets)
+        return assets
 
     def fetch_bars(
         self,
@@ -401,18 +528,32 @@ class LocalMarketDataProvider:
         bar_size: str = "1d",
         limit: int | None = None,
     ) -> list[MarketBar]:
+        if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT and bar_size != "1d":
+            raise ValueError("japan_cash_equity_v1 supports only bar_size=1d")
         records = read_filtered_local_records(
             self.bars_path,
             equals={
                 **({"symbol": symbols} if symbols is not None else {}),
-                "bar_size": bar_size,
+                **(
+                    {}
+                    if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT
+                    else {"bar_size": bar_size}
+                ),
             },
             timestamp_field="ts",
             start=start,
             end=end,
             limit=limit,
         )
-        return [self._bar(record) for record in records]
+        if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT:
+            for record in records:
+                validate_japan_bar_record(record)
+        bars = [self._bar(record) for record in records]
+        if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT:
+            bar_symbols = sorted({bar.symbol for bar in bars})
+            assets = self.fetch_assets(symbols=bar_symbols)
+            validate_japan_market_dataset(assets, bars)
+        return bars
 
     def fetch_decision_times(
         self,
@@ -423,7 +564,21 @@ class LocalMarketDataProvider:
         bar_size: str = "1d",
         limit: int | None = None,
     ) -> tuple[datetime, ...]:
-        """Read only bar timestamps to choose whole decision cross-sections."""
+        """Read only timing columns to choose whole decision cross-sections."""
+
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
+        if self.market_contract == JAPAN_CASH_EQUITY_CONTRACT:
+            if bar_size != "1d":
+                raise ValueError("japan_cash_equity_v1 supports only bar_size=1d")
+            return _japan_market_decision_times(
+                self.bars_path,
+                symbols=symbols,
+                bar_size=bar_size,
+                start=start,
+                end=end,
+                limit=limit,
+            )
 
         records = read_filtered_local_records(
             self.bars_path,
@@ -474,6 +629,12 @@ class LocalMarketDataProvider:
             figi=_optional_str(record.get("figi")),
             isin=_optional_str(record.get("isin")),
             industry=_optional_str(record.get("industry")),
+            short_available=_optional_bool(record.get("short_available")),
+            hard_to_borrow=_optional_bool(
+                record.get("hard_to_borrow"),
+                default=_optional_bool(record.get("short_available")),
+            ),
+            trading_unit=_optional_int(record.get("trading_unit"), "trading_unit"),
         )
 
     @staticmethod
@@ -495,6 +656,12 @@ class LocalMarketDataProvider:
                 record.get("adjustment_vintage_at"), "adjustment_vintage_at"
             ),
             return_adjustment_factor=float(_required(record, "return_adjustment_factor")),
+            exchange=_optional_str(record.get("exchange")),
+            currency=_optional_str(record.get("currency")),
+            trading_unit=_optional_int(record.get("trading_unit"), "trading_unit"),
+            session_date=_optional_date(record.get("session_date"), "session_date"),
+            available_at=_optional_datetime(record.get("available_at"), "available_at"),
+            price_basis=_optional_raw_price_basis(record.get("price_basis")),
         )
 
     @staticmethod

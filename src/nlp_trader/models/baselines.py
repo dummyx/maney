@@ -37,40 +37,145 @@ FEATURE_SETS["combined"] = FEATURE_SETS["traditional"] + FEATURE_SETS["text"]
 BENCHMARK_FAMILIES = ("equal_weight", "momentum_only", "no_trade")
 
 _TEXT_PREFIXES = (
+    "abnormal_mention_volume_",
+    "author_disagreement_",
+    "credible_attention_",
+    "duplicate_item_count_",
     "text_",
     "sentiment_",
     "attention_",
+    "latest_text_",
+    "mention_velocity_",
+    "novel_item_count_",
     "novelty_",
     "disagreement_",
     "credibility_",
     "event_",
+    "source_credibility_",
+    "source_disagreement_",
+    "source_diversity_",
+    "source_identity_",
+    "spam_score_",
+    "time_since_first_seen_",
+    "unique_author_count_",
 )
 _TRADITIONAL_PREFIXES = (
+    "amihud_illiquidity_",
+    "average_dollar_volume_",
+    "dollar_volume",
     "return_",
     "momentum_",
     "reversal_",
+    "short_term_reversal_",
     "gap_",
+    "intraday_return",
     "abnormal_volume_",
-    "turnover_",
+    "turnover",
     "illiquidity_",
     "spread_",
+    "high_low_spread_",
     "realized_volatility_",
     "downside_volatility_",
     "high_low_volatility_",
-    "volatility_regime_",
+    "volatility_regime",
     "market_beta_",
+    "market_return_",
+    "market_residual_return_",
+    "sector_data_",
     "sector_return_",
+    "sector_residual_return_",
     "residual_return_",
     "size_",
     "value_",
     "quality_",
+    "fundamental_",
     "earnings_",
     "ex_dividend_",
+    "known_event_",
+    "volume_history_",
 )
 
+type LabelKey = tuple[str, str, str]
 
-def _key(row: dict[str, Any]) -> tuple[str, str, str]:
+
+def _key(row: dict[str, Any]) -> LabelKey:
     return str(row["asset_id"]), str(row["asof_ts"]), str(row["horizon"])
+
+
+def complete_label_cross_sections(
+    rows: list[dict[str, Any]],
+    labels: list[dict[str, Any]],
+    *,
+    row_name: str,
+) -> tuple[dict[LabelKey, dict[str, Any]], frozenset[LabelKey]]:
+    """Validate label coverage without selecting individual assets by future outcomes.
+
+    Every candidate row must have exactly one label. A decision-and-horizon cross-section is
+    either wholly observed or wholly censored. Wholly censored groups are safe to omit only when
+    every expected label end is beyond the final candidate decision boundary.
+    """
+
+    labels_by_key: dict[LabelKey, dict[str, Any]] = {}
+    for label in labels:
+        key = _key(label)
+        if key in labels_by_key:
+            raise ValueError(f"duplicate label row: {key}")
+        labels_by_key[key] = label
+
+    missing_labels = [_key(row) for row in rows if _key(row) not in labels_by_key]
+    if missing_labels:
+        raise ValueError(f"{row_name} have no matching labels: {missing_labels}")
+    if not rows:
+        return labels_by_key, frozenset()
+
+    final_decision_ts = max(parse_utc(str(row["asof_ts"])) for row in rows)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(str(row["asof_ts"]), str(row["horizon"]))].append(row)
+
+    observed_keys: set[LabelKey] = set()
+    ordered_groups = sorted(
+        grouped.items(),
+        key=lambda item: (parse_utc(item[0][0]), item[0][1]),
+    )
+    for (asof_ts, horizon), group_rows in ordered_groups:
+        group_keys = [_key(row) for row in group_rows]
+        observed = [labels_by_key[key].get("forward_return") is not None for key in group_keys]
+        if all(observed):
+            observed_keys.update(group_keys)
+            continue
+        if any(observed):
+            raise ValueError(
+                "partial forward-label coverage would select the research cross-section "
+                f"using future availability at {asof_ts} horizon {horizon}"
+            )
+        expected_ends = [labels_by_key[key].get("expected_label_end_ts") for key in group_keys]
+        if any(value is None for value in expected_ends) or any(
+            parse_utc(str(value)) <= final_decision_ts for value in expected_ends
+        ):
+            raise ValueError(
+                "non-terminal decision has no forward-label coverage at "
+                f"{asof_ts} horizon {horizon}"
+            )
+    return labels_by_key, frozenset(observed_keys)
+
+
+def chronological_holdout_split(
+    observed_keys: frozenset[LabelKey],
+    final_holdout_periods: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split fully observed decision times into development and final-holdout windows."""
+
+    if final_holdout_periods < 0:
+        raise ValueError("final_holdout_periods must be non-negative")
+    complete_times = tuple(sorted({key[1] for key in observed_keys}, key=parse_utc))
+    if not final_holdout_periods:
+        return complete_times, ()
+    if final_holdout_periods >= len(complete_times):
+        raise ValueError(
+            "final_holdout_periods must leave at least one fully observed development period"
+        )
+    return complete_times[:-final_holdout_periods], complete_times[-final_holdout_periods:]
 
 
 def _correlation(xs: list[float], ys: list[float]) -> float:
@@ -92,7 +197,7 @@ def _horizon_steps(value: object) -> int:
     return max(1, int(digits)) if digits else 1
 
 
-def _label_availability(labels: list[dict[str, Any]]) -> dict[tuple[str, str, str], str]:
+def label_availability_by_key(labels: list[dict[str, Any]]) -> dict[LabelKey, str]:
     """Infer when each forward label became observable from ordered asset sessions.
 
     An explicit ``label_available_at`` or ``available_at`` wins. Otherwise a 5d label is
@@ -109,7 +214,7 @@ def _label_availability(labels: list[dict[str, Any]]) -> dict[tuple[str, str, st
         rows.sort(key=lambda row: parse_utc(str(row["asof_ts"])))
         for index, row in enumerate(rows):
             explicit = (
-                row.get("label_available_at") or row.get("label_end_ts") or row.get("available_at")
+                row.get("label_available_at") or row.get("available_at") or row.get("label_end_ts")
             )
             if explicit is not None:
                 available[_key(row)] = str(explicit)
@@ -122,8 +227,12 @@ def _label_availability(labels: list[dict[str, Any]]) -> dict[tuple[str, str, st
 
 def _discover_columns(features: list[dict[str, Any]]) -> dict[str, list[str]]:
     keys = {str(key) for row in features for key in row}
-    text = sorted(key for key in keys if key.startswith(_TEXT_PREFIXES))
-    traditional = sorted(key for key in keys if key.startswith(_TRADITIONAL_PREFIXES))
+    text = sorted(
+        key for key in keys if key.startswith(_TEXT_PREFIXES) and "available_at" not in key
+    )
+    traditional = sorted(
+        key for key in keys if key.startswith(_TRADITIONAL_PREFIXES) and "available_at" not in key
+    )
     for column in FEATURE_SETS["text"]:
         if column in keys and column not in text:
             text.append(column)
@@ -258,23 +367,35 @@ def train_baselines(
     model_version: str,
     min_train_rows: int = 0,
     embargo_periods: int = 0,
+    final_holdout_periods: int = 0,
     record_training_keys: bool = False,
 ) -> dict[str, Any]:
-    """Fit deterministic expanding-window snapshots without future-label leakage."""
+    """Fit causal development snapshots and freeze one pre-holdout model for final testing."""
 
     if min_train_rows < 0:
         raise ValueError("min_train_rows must be non-negative")
     if embargo_periods < 0:
         raise ValueError("embargo_periods must be non-negative")
-    labels_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for label in labels:
-        key = _key(label)
-        if key in labels_by_key:
-            raise ValueError(f"duplicate label row: {key}")
-        if label.get("forward_return") is not None:
-            labels_by_key[key] = label
+    labels_by_key, observed_keys = complete_label_cross_sections(
+        features,
+        labels,
+        row_name="features",
+    )
+    _, holdout_times = chronological_holdout_split(observed_keys, final_holdout_periods)
+    holdout_start = holdout_times[0] if holdout_times else None
+    holdout_start_ts = parse_utc(holdout_start) if holdout_start is not None else None
 
-    availability = _label_availability(labels)
+    availability = label_availability_by_key(labels)
+    invalid_availability = sorted(
+        key
+        for key in observed_keys
+        if key in availability and parse_utc(availability[key]) <= parse_utc(key[1])
+    )
+    if invalid_availability:
+        raise ValueError(
+            "forward-label availability must be strictly after its decision timestamp: "
+            f"{invalid_availability}"
+        )
     columns_by_family = _discover_columns(features)
     all_columns = sorted({column for columns in columns_by_family.values() for column in columns})
     events = sorted(
@@ -285,17 +406,34 @@ def train_baselines(
             labels_by_key[_key(row)],
         )
         for row in features
-        if _key(row) in labels_by_key and _key(row) in availability
+        if _key(row) in observed_keys
+        and _key(row) in availability
+        and (holdout_start_ts is None or parse_utc(str(row["asof_ts"])) < holdout_start_ts)
     )
     running = _RunningFit(all_columns, record_keys=record_training_keys)
     event_index = 0
     decision_times = sorted({str(row["asof_ts"]) for row in features}, key=parse_utc)
+    frozen_training_cutoff = None
+    if holdout_start_ts is not None:
+        holdout_index = next(
+            index
+            for index, decision_time in enumerate(decision_times)
+            if parse_utc(decision_time) == holdout_start_ts
+        )
+        frozen_cutoff_index = max(0, holdout_index - embargo_periods)
+        frozen_training_cutoff = parse_utc(decision_times[frozen_cutoff_index])
     snapshots: list[dict[str, Any]] = []
     for decision_index, decision_time in enumerate(decision_times):
         decision_ts = parse_utc(decision_time)
-        cutoff_index = max(0, decision_index - embargo_periods)
-        training_cutoff = parse_utc(decision_times[cutoff_index])
-        effective_cutoff = min(decision_ts, training_cutoff)
+        is_final_holdout = holdout_start_ts is not None and decision_ts >= holdout_start_ts
+        if is_final_holdout:
+            if frozen_training_cutoff is None:  # pragma: no cover - guarded by holdout_start
+                raise RuntimeError("final-holdout training cutoff was not initialized")
+            effective_cutoff = frozen_training_cutoff
+        else:
+            cutoff_index = max(0, decision_index - embargo_periods)
+            training_cutoff = parse_utc(decision_times[cutoff_index])
+            effective_cutoff = min(decision_ts, training_cutoff)
         while event_index < len(events) and events[event_index][0] < effective_cutoff:
             _, _, feature, label = events[event_index]
             running.add(feature, label)
@@ -308,6 +446,9 @@ def train_baselines(
             "eligible_training_rows": running.rows,
             "training_key_count": running.rows if trained else 0,
             "training_key_digest": running.key_digest() if trained else _training_key_digest([]),
+            "training_snapshot_role": (
+                "frozen_final_holdout" if is_final_holdout else "development_walk_forward"
+            ),
             "families": running.fit_families(columns_by_family)
             if trained
             else _fit_families([], columns_by_family),
@@ -318,11 +459,43 @@ def train_baselines(
 
     empty_families = _fit_families([], columns_by_family)
     latest_families = snapshots[-1]["families"] if snapshots else empty_families
+    frozen_snapshot = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if snapshot["training_snapshot_role"] == "frozen_final_holdout"
+        ),
+        None,
+    )
+    final_holdout_training: dict[str, Any]
+    if frozen_snapshot is None:
+        final_holdout_training = {
+            "name": "disabled",
+            "enabled": False,
+            "final_holdout_periods": 0,
+            "update_rule": "expanding walk-forward training continues at every decision",
+        }
+    else:
+        final_holdout_training = {
+            "name": "frozen_pre_holdout_snapshot_v1",
+            "enabled": True,
+            "final_holdout_periods": len(holdout_times),
+            "final_holdout_start": holdout_start,
+            "frozen_snapshot_asof_ts": frozen_snapshot["asof_ts"],
+            "training_cutoff_exclusive": frozen_snapshot["training_cutoff_exclusive"],
+            "eligible_training_rows": frozen_snapshot["eligible_training_rows"],
+            "training_key_count": frozen_snapshot["training_key_count"],
+            "training_key_digest": frozen_snapshot["training_key_digest"],
+            "label_eligibility_rule": ("label availability timestamp < training_cutoff_exclusive"),
+            "training_key_rule": "training key asof_ts < final_holdout_start",
+            "update_rule": "no training updates at or after final_holdout_start",
+        }
     return {
         "model_version": model_version,
-        "training_protocol": "incremental_expanding_walk_forward_strict_availability_v3",
+        "training_protocol": "incremental_expanding_walk_forward_complete_cross_sections_v5",
         "min_train_rows": min_train_rows,
         "embargo_periods": embargo_periods,
+        "final_holdout_training": final_holdout_training,
         "families": latest_families,
         "walk_forward_snapshots": snapshots,
         "benchmark_families": list(BENCHMARK_FAMILIES),

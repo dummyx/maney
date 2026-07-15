@@ -11,6 +11,7 @@ from nlp_trader.backtest.costs import (
 )
 from nlp_trader.config import BacktestConfig
 from nlp_trader.features.build import finite_float
+from nlp_trader.paper.ledger import PaperEventLedger
 from nlp_trader.portfolio.constraints import constraints_from_config
 from nlp_trader.portfolio.construction import constrain_target_weights
 from nlp_trader.portfolio.risk import (
@@ -19,7 +20,7 @@ from nlp_trader.portfolio.risk import (
     drift_weights,
     risk_estimate_flags,
 )
-from nlp_trader.timestamps import parse_utc
+from nlp_trader.timestamps import format_utc, parse_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +62,20 @@ class PaperOrderIntent:
 class PaperSimulator:
     """Deterministic in-memory simulator; it deliberately exposes no broker adapter."""
 
-    def __init__(self, config: BacktestConfig, *, initial_capital: float = 1_000_000.0) -> None:
+    def __init__(
+        self,
+        config: BacktestConfig,
+        *,
+        initial_capital: float = 1_000_000.0,
+        ledger: PaperEventLedger | None = None,
+    ) -> None:
         if initial_capital <= 0:
             raise ValueError("initial_capital must be positive")
+        if ledger is not None and ledger.replay():
+            raise ValueError(
+                "PaperSimulator requires an empty ledger; resuming existing paper state "
+                "is not supported"
+            )
         self._constraints = constraints_from_config(config)
         self._cost_model = cost_model_from_config(config)
         self._config = config
@@ -74,12 +86,18 @@ class PaperSimulator:
         self._last_ts: str | None = None
         self._events: list[dict[str, Any]] = []
         self._trades: list[dict[str, Any]] = []
+        self._ledger = ledger
 
-    def _check_time(self, asof_ts: str) -> None:
+    def _check_time(self, asof_ts: str) -> str:
         current = parse_utc(asof_ts)
         if self._last_ts is not None and current < parse_utc(self._last_ts):
             raise ValueError("paper events must be submitted in timestamp order")
-        self._last_ts = asof_ts
+        return format_utc(current)
+
+    def _persist_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        if self._ledger is None:
+            return event
+        return self._ledger.append(event)
 
     @staticmethod
     def _volatility(row: dict[str, Any]) -> float:
@@ -99,20 +117,20 @@ class PaperSimulator:
         ]
         if not parsed:
             raise ValueError("paper rebalance requires at least one intent")
-        asof_times = {intent.asof_ts for intent in parsed}
+        asof_times = {format_utc(parse_utc(intent.asof_ts)) for intent in parsed}
         if len(asof_times) != 1:
             raise ValueError("all paper intents in a rebalance must share asof_ts")
-        asof_ts = parsed[0].asof_ts
-        self._check_time(asof_ts)
+        asof_ts = self._check_time(next(iter(asof_times)))
 
         rows_by_asset: dict[str, dict[str, Any]] = {}
+        next_metadata = dict(self._metadata)
         for row in market_rows:
             asset_id = str(row["asset_id"])
             if asset_id in rows_by_asset:
                 raise ValueError(f"duplicate paper market row: {asset_id}")
             resolved = conservative_risk_estimates(row, self._config)
             rows_by_asset[asset_id] = resolved
-            self._metadata[asset_id] = resolved
+            next_metadata[asset_id] = resolved
         desired: dict[str, float] = {}
         reasons: dict[str, tuple[str, ...]] = {}
         for intent in parsed:
@@ -121,8 +139,8 @@ class PaperSimulator:
             desired[intent.asset_id] = intent.target_weight
             reasons[intent.asset_id] = intent.reason_codes
         for asset_id in self._positions:
-            if asset_id not in rows_by_asset and asset_id in self._metadata:
-                rows_by_asset[asset_id] = self._metadata[asset_id]
+            if asset_id not in rows_by_asset and asset_id in next_metadata:
+                rows_by_asset[asset_id] = next_metadata[asset_id]
 
         decision = constrain_target_weights(
             desired,
@@ -139,7 +157,7 @@ class PaperSimulator:
             delta = target - previous
             if abs(delta) <= 1e-12:
                 continue
-            row = self._metadata.get(asset_id, {})
+            row = next_metadata.get(asset_id, {})
             costs = cost_breakdown(
                 abs(delta),
                 self._cost_model,
@@ -164,17 +182,16 @@ class PaperSimulator:
                 "simulation_only": True,
             }
             trade_records.append(trade)
-            self._trades.append(trade)
         cost_return = sum(cost.total for cost in execution_costs)
-        self._equity *= max(0.0, 1.0 - cost_return)
-        self._positions = dict(decision.target_weights)
-        exposure = calculate_exposures(self._positions, self._metadata)
+        next_equity = self._equity * max(0.0, 1.0 - cost_return)
+        next_positions = dict(decision.target_weights)
+        exposure = calculate_exposures(next_positions, next_metadata)
         event = {
             "event_type": "paper_rebalance",
             "asof_ts": asof_ts,
             "simulation_only": True,
             "cost_return": cost_return,
-            "equity": self._equity,
+            "equity": next_equity,
             "turnover": decision.turnover,
             "exposures": exposure.to_dict(),
             "rejected": {
@@ -185,37 +202,47 @@ class PaperSimulator:
                 | {
                     flag
                     for asset_id in decision.target_weights
-                    for flag in risk_estimate_flags(self._metadata.get(asset_id, {}))
+                    for flag in risk_estimate_flags(next_metadata.get(asset_id, {}))
                 }
             ),
             "trades": trade_records,
         }
-        self._events.append(event)
-        return event
+        persisted = self._persist_event(event)
+        self._equity = next_equity
+        self._positions = next_positions
+        self._metadata = next_metadata
+        self._last_ts = asof_ts
+        self._trades.extend(trade_records)
+        self._events.append(persisted)
+        return persisted
 
     def mark_to_market(self, asof_ts: str, asset_returns: dict[str, float]) -> dict[str, Any]:
-        self._check_time(asof_ts)
+        asof_ts = self._check_time(asof_ts)
         gross_return = sum(
             weight * finite_float(asset_returns.get(asset_id, 0.0))
             for asset_id, weight in self._positions.items()
         )
-        self._equity *= max(0.0, 1.0 + gross_return)
-        self._positions = drift_weights(
+        next_equity = self._equity * max(0.0, 1.0 + gross_return)
+        next_positions = drift_weights(
             self._positions,
             asset_returns,
             portfolio_return=gross_return,
         )
-        exposure = calculate_exposures(self._positions, self._metadata)
+        exposure = calculate_exposures(next_positions, self._metadata)
         event = {
             "event_type": "paper_mark_to_market",
             "asof_ts": asof_ts,
             "simulation_only": True,
             "gross_return": gross_return,
-            "equity": self._equity,
+            "equity": next_equity,
             "exposures": exposure.to_dict(),
         }
-        self._events.append(event)
-        return event
+        persisted = self._persist_event(event)
+        self._equity = next_equity
+        self._positions = next_positions
+        self._last_ts = asof_ts
+        self._events.append(persisted)
+        return persisted
 
     def snapshot(self) -> dict[str, Any]:
         return {

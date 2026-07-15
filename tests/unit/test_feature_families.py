@@ -5,6 +5,8 @@ from datetime import UTC, date, datetime
 from math import isclose
 from pathlib import Path
 
+import pytest
+
 from nlp_trader.config import ResearchConfig, load_config
 from nlp_trader.features.build import build_feature_rows, build_label_rows
 from nlp_trader.schemas import (
@@ -106,6 +108,8 @@ def _signal(
         novelty=novelty,
         source_credibility=0.9,
         model_version="test",
+        source=f"source-{item_id}",
+        source_type="news" if novelty > 0.5 else "social",
         event_type=event_type,
         spam_score=0.0,
     )
@@ -141,21 +145,30 @@ def test_feature_builder_emits_text_and_traditional_families(tmp_path: Path) -> 
         if value["symbol"] == "AAA" and value["asof_ts"].startswith("2026-07-09")
     )
 
-    assert row["text_count_3d"] == 2
+    assert row["text_count_3d"] == 1
+    assert row["raw_text_count_3d"] == 2
     assert row["text_missing_3d"] is False
-    assert row["latest_text_available_at_3d"] == "2026-07-09T12:00:00Z"
+    assert row["latest_text_available_at_3d"] == "2026-07-08T12:00:00Z"
     assert row["text_decay_half_life_days_3d"] == 1.0
     assert row["time_since_first_seen_hours_3d"] == 32.0
-    assert row["sentiment_mean_3d"] == 0.0
-    assert row["sentiment_decay_weighted_3d"] < 0.0
-    assert row["sentiment_dispersion_3d"] > 0.0
-    assert row["attention_item_count_3d"] == 2
+    assert row["sentiment_mean_3d"] == 1.0
+    assert row["sentiment_decay_weighted_3d"] == 1.0
+    assert row["sentiment_dispersion_3d"] == 0.0
+    assert row["attention_item_count_3d"] == 1
+    assert row["raw_attention_item_count_3d"] == 2
+    assert row["mention_velocity_3d"] == pytest.approx(1.0 / 3.0)
+    assert row["raw_mention_velocity_3d"] == pytest.approx(2.0 / 3.0)
+    assert row["attention_abnormal_3d"] == 1.0
+    assert row["raw_attention_abnormal_3d"] == 2.0
     assert row["novelty_share_3d"] == 0.5
     assert row["duplicate_item_count_3d"] == 1
     assert row["source_credibility_mean_3d"] == 0.9
-    assert row["event_item_count_3d"] == 2
+    assert row["source_diversity_count_3d"] == 1
+    assert row["attention_source_news_count_3d"] == 1
+    assert row["attention_source_social_count_3d"] == 0
+    assert row["event_item_count_3d"] == 1
     assert row["event_earnings_count_3d"] == 1
-    assert row["event_guidance_count_3d"] == 1
+    assert row["event_guidance_count_3d"] == 0
 
     assert row["price_basis"] == "causal_return_adjustment_factor"
     assert row["return_5d_missing"] is False
@@ -256,3 +269,115 @@ def test_known_fundamentals_and_event_calendars_are_point_in_time(tmp_path: Path
     assert row["earnings_blackout"] is True
     assert row["ex_dividend_proximity_missing"] is False
     assert row["known_event_blackout"] is True
+
+
+def test_duplicate_only_window_retains_raw_counts_without_independent_evidence(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    rows = build_feature_rows(
+        [_bar("alpha", "AAA", 9, 50.0, 50.0, 1_000_000)],
+        [_signal("duplicate", 9, -1.0, novelty=0.5, event_type="guidance")],
+        config,
+    )
+
+    row = rows[0]
+    assert row["text_count_3d"] == 0
+    assert row["raw_text_count_3d"] == 1
+    assert row["attention_item_count_3d"] == 0.0
+    assert row["raw_attention_item_count_3d"] == 1
+    assert row["mention_velocity_3d"] == 0.0
+    assert row["raw_mention_velocity_3d"] == pytest.approx(1.0 / 3.0)
+    assert row["attention_abnormal_3d"] == 0.0
+    assert row["raw_attention_abnormal_3d"] == 1.0
+    assert row["duplicate_item_count_3d"] == 1
+    assert row["novel_item_count_3d"] == 0
+    assert row["text_missing_3d"] is True
+    assert row["sentiment_mean_3d"] == 0.0
+    assert row["source_diversity_missing_3d"] is True
+    assert row["event_item_count_3d"] == 0
+    assert row["event_guidance_count_3d"] == 0
+
+
+def test_attention_abnormal_uses_novelty_filtered_prior_evidence(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    rows = build_feature_rows(
+        [_bar("alpha", "AAA", 9, 50.0, 50.0, 1_000_000)],
+        [
+            _signal("prior-independent", 4, 0.5, novelty=1.0, event_type="earnings"),
+            _signal("prior-copy-1", 5, -1.0, novelty=0.5, event_type="earnings"),
+            _signal("prior-copy-2", 5, -1.0, novelty=0.0, event_type="earnings"),
+            _signal("current-independent", 8, 1.0, novelty=1.0, event_type="earnings"),
+        ],
+        config,
+    )
+
+    row = rows[0]
+    assert row["text_count_3d"] == 1
+    assert row["raw_text_count_3d"] == 1
+    assert row["attention_abnormal_3d"] == 1.0
+    assert row["raw_attention_abnormal_3d"] == pytest.approx(1.0 / 3.0)
+
+
+def test_asset_cross_sections_respect_active_periods_and_global_bar_bounds(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    alpha = Asset(
+        asset_id="alpha",
+        symbol="AAA",
+        exchange="XNAS",
+        currency="USD",
+        name="Alpha",
+        sector="Technology",
+        active_from=None,
+        active_to=None,
+        short_available=True,
+        hard_to_borrow=True,
+    )
+    beta = Asset(
+        asset_id="beta",
+        symbol="BBB",
+        exchange="XNAS",
+        currency="USD",
+        name="Beta",
+        sector="Financials",
+        active_from=date(2026, 7, 2),
+        active_to=date(2026, 7, 2),
+    )
+
+    bounded = build_feature_rows(
+        [_bar("alpha", "AAA", 1, 50.0, 50.0, 1_000_000)],
+        [],
+        config,
+        [alpha, beta],
+    )
+    assert len(bounded) == 1
+
+    complete = build_feature_rows(
+        [
+            _bar("alpha", "AAA", 1, 50.0, 50.0, 1_000_000),
+            _bar("alpha", "AAA", 2, 51.0, 51.0, 1_000_000),
+            _bar("beta", "BBB", 2, 20.0, 20.0, 1_000_000),
+        ],
+        [],
+        config,
+        [alpha, beta],
+    )
+    alpha_row = next(row for row in complete if row["asset_id"] == "alpha")
+    beta_row = next(row for row in complete if row["asset_id"] == "beta")
+    assert alpha_row["short_available"] is True
+    assert alpha_row["hard_to_borrow"] is True
+    assert beta_row["short_available"] is False
+    assert beta_row["hard_to_borrow"] is False
+
+    with pytest.raises(ValueError, match="missing active asset market bars.*beta"):
+        build_feature_rows(
+            [
+                _bar("alpha", "AAA", 1, 50.0, 50.0, 1_000_000),
+                _bar("alpha", "AAA", 2, 51.0, 51.0, 1_000_000),
+            ],
+            [],
+            config,
+            [alpha, beta],
+        )

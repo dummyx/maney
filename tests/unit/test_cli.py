@@ -61,6 +61,7 @@ def test_typer_help_lists_preserved_and_new_commands() -> None:
         "validate-config",
         "ingest-market",
         "ingest-text",
+        "annotate-text",
         "build-features",
         "build-labels",
         "train",

@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from nlp_trader.schemas import Asset, EntityMention, MarketBar, TextItem
 from nlp_trader.timestamps import format_utc, parse_optional_date, parse_utc
@@ -18,10 +18,37 @@ def _float_or_none(value: str | None) -> float | None:
     return float(value)
 
 
+def _int_or_none(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
 def _datetime_or_none(value: str | None) -> datetime | None:
     if value in (None, ""):
         return None
     return parse_utc(value)
+
+
+def _raw_price_basis_or_none(value: str | None) -> Literal["raw_tradable"] | None:
+    if value in (None, ""):
+        return None
+    if value != "raw_tradable":
+        raise ValueError("price_basis must be raw_tradable")
+    return "raw_tradable"
+
+
+def _bool_or_default(value: object, *, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value!r}")
 
 
 def read_assets(path: Path) -> list[Asset]:
@@ -40,6 +67,12 @@ def read_assets(path: Path) -> list[Asset]:
                 figi=row.get("figi") or None,
                 isin=row.get("isin") or None,
                 industry=row.get("industry") or None,
+                short_available=_bool_or_default(row.get("short_available")),
+                hard_to_borrow=_bool_or_default(
+                    row.get("hard_to_borrow"),
+                    default=_bool_or_default(row.get("short_available")),
+                ),
+                trading_unit=_int_or_none(row.get("trading_unit")),
             )
             for row in csv.DictReader(handle)
         ]
@@ -63,6 +96,12 @@ def read_market_bars(path: Path) -> list[MarketBar]:
                 corporate_action_adjusted=row["corporate_action_adjusted"].lower() == "true",
                 adjustment_vintage_at=_datetime_or_none(row.get("adjustment_vintage_at")),
                 return_adjustment_factor=float(row["return_adjustment_factor"]),
+                exchange=row.get("exchange") or None,
+                currency=row.get("currency") or None,
+                trading_unit=_int_or_none(row.get("trading_unit")),
+                session_date=parse_optional_date(row.get("session_date")),
+                available_at=_datetime_or_none(row.get("available_at")),
+                price_basis=_raw_price_basis_or_none(row.get("price_basis")),
             )
             for row in csv.DictReader(handle)
         ]
@@ -165,6 +204,9 @@ def asset_to_record(asset: Asset) -> dict[str, Any]:
         "figi": asset.figi,
         "isin": asset.isin,
         "industry": asset.industry,
+        "short_available": asset.short_available,
+        "hard_to_borrow": asset.hard_to_borrow,
+        "trading_unit": asset.trading_unit,
     }
 
 
@@ -186,6 +228,12 @@ def market_bar_to_record(bar: MarketBar) -> dict[str, Any]:
         if bar.adjustment_vintage_at
         else None,
         "return_adjustment_factor": bar.return_adjustment_factor,
+        "exchange": bar.exchange,
+        "currency": bar.currency,
+        "trading_unit": bar.trading_unit,
+        "session_date": bar.session_date.isoformat() if bar.session_date else None,
+        "available_at": format_utc(bar.available_at) if bar.available_at else None,
+        "price_basis": bar.price_basis,
     }
 
 

@@ -8,12 +8,13 @@ paths:
   processed_dir: ../data/processed/backtest
   models_dir: ../models/backtest
   reports_dir: ../reports/backtest
+  llm_model: null
 data:
   storage_format: parquet
   compression: zstd
   write_batch_rows: 10000
   calendar: XNYS
-  schema_version: "1"
+  schema_version: "2"
   market_license_or_terms_ref: synthetic-fixture-v1
   text_license_or_terms_ref: synthetic-fixture-v1
 features:
@@ -22,15 +23,16 @@ features:
   text_warmup_days: 40
   event_lookahead_days: 30
   horizon_days: 1
-  feature_set_version: backtest-v2
+  feature_set_version: backtest-v3
   label_version: backtest-v2
-  model_version: backtest-walk-forward-v2
+  model_version: backtest-walk-forward-v3
   text_decay_half_life_days: 1.0
   decision_time: close
 models:
   families: [traditional, text, combined]
   min_train_rows: 4
   embargo_periods: 1
+  final_holdout_periods: 2
   top_k: 2
 backtest:
   commission_bps: 1.0
@@ -69,3 +71,19 @@ transformer:
   batch_size: 16
   max_sequence_length: 256
   local_files_only: true
+llm_annotations:
+  enabled: false
+  apply_to_features: false
+  backend: transformers_causal_lm
+  model_id: null
+  model_revision: null
+  model_license_or_terms_ref: null
+  prompt_version: entity-event-v1
+  schema_version: entity-event-v1
+  batch_size: 1
+  max_input_tokens: 2048
+  max_new_tokens: 384
+  decoding: greedy
+  seed: 7
+  local_files_only: true
+  trust_remote_code: false

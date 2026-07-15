@@ -79,6 +79,12 @@ def write_report(
     """Write a complete, human-readable and assumption-explicit research note."""
 
     metrics = backtest.get("metrics", {})
+    evaluation_window = backtest.get("evaluation_window", {})
+    evaluation_window_name = (
+        str(evaluation_window.get("name", "unspecified"))
+        if isinstance(evaluation_window, dict)
+        else "unspecified"
+    )
     rid = report_run_id or run_id(config, metrics)
     timestamp = (created_at or datetime.now(UTC)).astimezone(UTC)
     code = code_version or {"git_commit": None, "dirty": None}
@@ -155,7 +161,7 @@ def write_report(
             f"- shorting_allowed: `{config.backtest.shorting_allowed}`",
             f"- hard_to_borrow_allowed: `{config.backtest.hard_to_borrow_allowed}`",
             "",
-            "## Backtest Metrics",
+            f"## Backtest Metrics ({evaluation_window_name})",
             "",
         ]
     )

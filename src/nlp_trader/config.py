@@ -26,6 +26,7 @@ class PathsConfig(FrozenModel):
     fundamentals: Path | None = None
     earnings_calendar: Path | None = None
     corporate_actions: Path | None = None
+    llm_model: Path | None = None
     raw_dir: Path
     interim_dir: Path
     processed_dir: Path
@@ -70,6 +71,7 @@ class ModelConfig(FrozenModel):
     )
     min_train_rows: int = Field(default=4, ge=2)
     embargo_periods: int = Field(default=0, ge=0)
+    final_holdout_periods: int = Field(default=1, ge=1)
     top_k: int = Field(default=5, ge=1)
 
     @model_validator(mode="after")
@@ -120,10 +122,26 @@ class DataConfig(FrozenModel):
     storage_format: Literal["parquet"] = "parquet"
     compression: Literal["zstd", "snappy", "uncompressed"] = "zstd"
     write_batch_rows: int = Field(default=10_000, ge=1)
-    calendar: str = "XNYS"
-    schema_version: str = "1"
+    calendar: Literal["XNYS", "XJPX"] = "XNYS"
+    market_contract: Literal["generic", "japan_cash_equity_v1"] = "generic"
+    schema_version: str = Field(default="2", min_length=1)
     market_license_or_terms_ref: str = Field(default="user-provided-local", min_length=1)
     text_license_or_terms_ref: str = Field(default="user-provided-local", min_length=1)
+
+    @model_validator(mode="after")
+    def validate_market_contract(self) -> DataConfig:
+        if self.market_contract == "japan_cash_equity_v1" and self.calendar != "XJPX":
+            raise ValueError("data.calendar must be XJPX for japan_cash_equity_v1")
+        if self.calendar == "XJPX" and self.market_contract != "japan_cash_equity_v1":
+            raise ValueError("data.market_contract must be japan_cash_equity_v1 for XJPX")
+        for field_name in (
+            "schema_version",
+            "market_license_or_terms_ref",
+            "text_license_or_terms_ref",
+        ):
+            if not getattr(self, field_name).strip():
+                raise ValueError(f"data.{field_name} must not be blank")
+        return self
 
 
 class RuntimeConfig(FrozenModel):
@@ -175,6 +193,43 @@ class TransformerConfig(FrozenModel):
         return self
 
 
+class LLMAnnotationsConfig(FrozenModel):
+    """Optional, local-only generative annotation settings."""
+
+    enabled: bool = False
+    apply_to_features: bool = False
+    backend: Literal["transformers_causal_lm"] = "transformers_causal_lm"
+    model_id: str | None = None
+    model_revision: str | None = None
+    model_license_or_terms_ref: str | None = None
+    prompt_version: str = Field(default="entity-event-v1", min_length=1)
+    schema_version: str = Field(default="entity-event-v1", min_length=1)
+    batch_size: int = Field(default=1, ge=1)
+    max_input_tokens: int = Field(default=2048, ge=1)
+    max_new_tokens: int = Field(default=384, ge=1)
+    decoding: Literal["greedy"] = "greedy"
+    seed: int = Field(default=7, ge=0)
+    local_files_only: Literal[True] = True
+    trust_remote_code: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_enabled_settings(self) -> LLMAnnotationsConfig:
+        if self.apply_to_features and not self.enabled:
+            raise ValueError("llm_annotations.enabled must be true when apply_to_features is true")
+        if self.enabled:
+            required = {
+                "model_id": self.model_id,
+                "model_revision": self.model_revision,
+                "model_license_or_terms_ref": self.model_license_or_terms_ref,
+            }
+            missing = sorted(
+                name for name, value in required.items() if value is None or not value.strip()
+            )
+            if missing:
+                raise ValueError("enabled llm_annotations requires: " + ", ".join(missing))
+        return self
+
+
 class ResearchConfig(FrozenModel):
     path: Path
     mode: Literal["sample", "full"]
@@ -185,12 +240,25 @@ class ResearchConfig(FrozenModel):
     data: DataConfig = DataConfig()
     runtime: RuntimeConfig = RuntimeConfig()
     transformer: TransformerConfig = TransformerConfig()
+    llm_annotations: LLMAnnotationsConfig = LLMAnnotationsConfig()
 
     @model_validator(mode="after")
     def validate_horizon_alignment(self) -> ResearchConfig:
         rebalance_days = int(self.backtest.rebalance_frequency.removesuffix("d"))
         if rebalance_days != self.features.horizon_days:
             raise ValueError("backtest.rebalance_frequency must match features.horizon_days")
+        if self.models.final_holdout_periods < self.features.horizon_days:
+            raise ValueError(
+                "models.final_holdout_periods must be at least features.horizon_days so the "
+                "holdout contains a scheduled non-overlapping rebalance"
+            )
+        if self.llm_annotations.enabled and self.paths.llm_model is None:
+            raise ValueError("paths.llm_model is required when llm_annotations.enabled is true")
+        if self.transformer.enabled and self.llm_annotations.apply_to_features:
+            raise ValueError(
+                "transformer sentiment and LLM annotation feature application cannot both be "
+                "enabled; LLM sidecar-only annotation may coexist with transformer sentiment"
+            )
         return self
 
     def content_hash(self) -> str:
@@ -270,6 +338,7 @@ def validate_config(config: ResearchConfig, *, require_inputs: bool = True) -> l
         "fundamentals",
         "earnings_calendar",
         "corporate_actions",
+        "llm_model",
     )
     if require_inputs:
         for name in ("assets", "market_bars", "text_items"):
@@ -284,6 +353,14 @@ def validate_config(config: ResearchConfig, *, require_inputs: bool = True) -> l
                 and not (path.is_dir() and any(path.rglob("*.parquet")))
             ):
                 errors.append(f"missing configured {name}: {path}")
+        if config.llm_annotations.enabled:
+            model_path = config.paths.llm_model
+            if model_path is None:
+                errors.append("missing llm_model: paths.llm_model is not configured")
+            elif not model_path.is_dir():
+                errors.append(f"llm_model must be a local directory: {model_path}")
+            elif not any(candidate.is_file() for candidate in model_path.rglob("*")):
+                errors.append(f"llm_model directory contains no files: {model_path}")
     write_roots = {
         "raw_dir": config.paths.raw_dir,
         "interim_dir": config.paths.interim_dir,

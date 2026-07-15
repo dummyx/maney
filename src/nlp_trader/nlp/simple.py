@@ -4,6 +4,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC
 from zoneinfo import ZoneInfo
 
 from nlp_trader.nlp.preprocess import (
@@ -88,7 +89,11 @@ SOURCE_CREDIBILITY = {
 }
 PROMOTIONAL_PHRASES = ("buy now", "can't lose", "guaranteed return", "going to the moon", "100x")
 LEGAL_SUFFIXES = (" corp", " corporation", " inc", " incorporated", " limited", " llc", " plc")
-_US_EQUITY_TIMEZONE = ZoneInfo("America/New_York")
+_EXCHANGE_TIMEZONES = {
+    "XNYS": ZoneInfo("America/New_York"),
+    "XNAS": ZoneInfo("America/New_York"),
+    "XJPX": ZoneInfo("Asia/Tokyo"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +113,8 @@ def normalize_text(value: str) -> str:
 
 
 def _asset_is_active(asset: Asset, item: TextItem) -> bool:
-    item_date = item.available_at.astimezone(_US_EQUITY_TIMEZONE).date()
+    timezone = _EXCHANGE_TIMEZONES.get(asset.exchange.upper(), UTC)
+    item_date = item.available_at.astimezone(timezone).date()
     return not (
         (asset.active_from is not None and item_date < asset.active_from)
         or (asset.active_to is not None and item_date > asset.active_to)

@@ -232,15 +232,27 @@ def construct_portfolio(
     constraints: PortfolioConstraints,
     *,
     equity: float,
+    top_k: int | None = None,
 ) -> PortfolioDecision:
     """Convert ranked model scores into constrained target weights."""
 
+    if top_k is not None and top_k < 1:
+        raise ValueError("top_k must be positive when set")
+
     metadata = _metadata_by_asset(rows)
     desired: dict[str, float] = {}
+    eligible = [
+        (asset_id, row)
+        for asset_id, row in metadata.items()
+        if finite_float(row.get("score")) > 0
+        or (finite_float(row.get("score")) < 0 and constraints.shorting_allowed)
+    ]
     ranked = sorted(
-        metadata.items(),
+        eligible,
         key=lambda pair: (-abs(finite_float(pair[1].get("score"))), pair[0]),
     )
+    if top_k is not None:
+        ranked = ranked[:top_k]
     for asset_id, row in ranked:
         score = finite_float(row.get("score"))
         if score > 0:

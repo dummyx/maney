@@ -50,6 +50,30 @@ def sha256_parquet_directory(
     return digest.hexdigest(), byte_count, manifest
 
 
+def sha256_directory(path: Path) -> tuple[str, int, list[dict[str, Any]]]:
+    """Hash every regular file in a local model directory by name and exact bytes."""
+
+    digest = hashlib.sha256()
+    byte_count = 0
+    manifest: list[dict[str, Any]] = []
+    for file_path in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+        relative = file_path.relative_to(path).as_posix().encode("utf-8")
+        file_digest = sha256_file(file_path)
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(file_digest))
+        size = file_path.stat().st_size
+        byte_count += size
+        manifest.append(
+            {
+                "relative_path": relative.decode("utf-8"),
+                "sha256": file_digest,
+                "bytes": size,
+            }
+        )
+    return digest.hexdigest(), byte_count, manifest
+
+
 def input_manifest(config: ResearchConfig) -> list[dict[str, Any]]:
     """Describe configured local inputs without embedding their contents."""
 
@@ -78,6 +102,33 @@ def input_manifest(config: ResearchConfig) -> list[dict[str, Any]]:
                     "bytes": byte_count,
                     "file_count": len(files),
                     "input_kind": "partitioned_parquet_directory",
+                    "files": files,
+                }
+            )
+        entries.append(entry)
+    if config.llm_annotations.enabled:
+        model_path = config.paths.llm_model
+        if model_path is None:
+            raise ValueError("enabled LLM annotations require a configured local model path")
+        exists = model_path.is_dir() and any(
+            candidate.is_file() for candidate in model_path.rglob("*")
+        )
+        entry = {
+            "role": "llm_model",
+            "path": str(model_path),
+            "exists": exists,
+            "input_kind": "local_model_directory",
+            "model_id": config.llm_annotations.model_id,
+            "model_revision": config.llm_annotations.model_revision,
+            "license_or_terms_ref": config.llm_annotations.model_license_or_terms_ref,
+        }
+        if exists:
+            digest, byte_count, files = sha256_directory(model_path)
+            entry.update(
+                {
+                    "sha256": digest,
+                    "bytes": byte_count,
+                    "file_count": len(files),
                     "files": files,
                 }
             )

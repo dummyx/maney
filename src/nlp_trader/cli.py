@@ -186,6 +186,26 @@ def ingest_text_command(
     )
 
 
+@app.command("annotate-text")
+def annotate_text_command(
+    config: ConfigOption = DEFAULT_CONFIG,
+    limit: LimitOption = None,
+    start_date: StartDateOption = None,
+    end_date: EndDateOption = None,
+    symbol: SymbolsOption = None,
+) -> None:
+    """Generate optional local, evidence-grounded per-entity LLM annotations."""
+
+    _run_pipeline_command(
+        pipeline.annotate_text,
+        config,
+        limit=limit,
+        start_date=start_date,
+        end_date=end_date,
+        symbols=symbol,
+    )
+
+
 @app.command("build-features")
 def build_features_command(
     config: ConfigOption = DEFAULT_CONFIG,

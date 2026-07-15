@@ -6,7 +6,16 @@ from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcals  # type: ignore[import-untyped]
 
-_NEW_YORK = ZoneInfo("America/New_York")
+_CALENDAR_ALIASES = {
+    # ``exchange_calendars`` exposes Tokyo under its operating MIC (XTKS) and
+    # the JPX alias. Accept XJPX as the research-facing name used by this
+    # project while keeping the upstream calendar data authoritative.
+    "XJPX": "XTKS",
+    "JPX": "XTKS",
+    "XTSE": "XTKS",
+}
+_DEFAULT_START = date(1990, 1, 1)
+_CALENDAR_DEFAULT_STARTS = {"XTKS": date(1997, 1, 1)}
 
 
 def _date_value(value: Any) -> date:
@@ -28,28 +37,46 @@ def _utc_datetime(value: Any) -> datetime:
 
 
 class USEquityCalendar:
-    """Point-in-time decision calendar backed by the versioned XNYS schedule.
+    """Point-in-time decision calendar backed by a versioned exchange schedule.
 
     The underlying package includes observed holidays, historical one-off closures,
     daylight-saving transitions, and official early closes. Bounds are explicit so
     research outside them fails instead of silently treating weekdays as sessions.
+
+    The legacy class name is retained for compatibility. ``calendar_name`` may be
+    ``XNYS`` or another calendar supported by ``exchange_calendars``; ``XJPX`` is
+    normalized to that package's canonical Tokyo Stock Exchange calendar, ``XTKS``.
     """
 
-    timezone = _NEW_YORK
+    timezone: ZoneInfo
 
     def __init__(
         self,
         *,
         calendar_name: str = "XNYS",
-        start: date = date(1990, 1, 1),
+        start: date | None = None,
         end: date = date(2035, 12, 31),
     ) -> None:
+        provider_calendar_name = _CALENDAR_ALIASES.get(calendar_name, calendar_name)
+        if start is None:
+            start = _CALENDAR_DEFAULT_STARTS.get(provider_calendar_name, _DEFAULT_START)
         if end < start:
             raise ValueError("calendar end must be on or after start")
         self.calendar_name = calendar_name
+        self.provider_calendar_name = provider_calendar_name
         self.start = start
         self.end = end
-        self._calendar: Any = xcals.get_calendar(calendar_name, start=start, end=end)
+        self._calendar: Any = xcals.get_calendar(
+            self.provider_calendar_name,
+            start=start,
+            end=end,
+        )
+        provider_timezone = self._calendar.tz
+        self.timezone = (
+            provider_timezone
+            if isinstance(provider_timezone, ZoneInfo)
+            else ZoneInfo(str(provider_timezone))
+        )
 
     def _require_bounds(self, value: date) -> None:
         if value < self.start or value > self.end:
@@ -94,17 +121,16 @@ class USEquityCalendar:
     def is_early_close(self, session_date: date) -> bool:
         if not self.is_session(session_date):
             return False
-        local_close = self.session_close(session_date).astimezone(self.timezone)
-        return (local_close.hour, local_close.minute) < (16, 0)
+        return session_date in {_date_value(value) for value in self._calendar.early_closes}
 
     def session_open(self, session_date: date) -> datetime:
         if not self.is_session(session_date):
-            raise ValueError(f"not a U.S.-equity session: {session_date.isoformat()}")
+            raise ValueError(f"not a {self.calendar_name} session: {session_date.isoformat()}")
         return _utc_datetime(self._calendar.session_open(session_date))
 
     def session_close(self, session_date: date) -> datetime:
         if not self.is_session(session_date):
-            raise ValueError(f"not a U.S.-equity session: {session_date.isoformat()}")
+            raise ValueError(f"not a {self.calendar_name} session: {session_date.isoformat()}")
         return _utc_datetime(self._calendar.session_close(session_date))
 
     def decision_times(self, start: date, end: date) -> tuple[datetime, ...]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime
 
 from nlp_trader.nlp.simple import link_entities, sentiment_score
 from nlp_trader.schemas import Asset, TextItem
@@ -40,6 +41,28 @@ def test_link_entities_requires_name_title_symbol_or_cashtag() -> None:
     assert not link_entities(_item("Market update", "AAA appears only in body text."), [_asset()])
     assert link_entities(_item("Market update", "$AAA backlog improved."), [_asset()])
     assert link_entities(_item("Alpha Analytics update", "Demand improved."), [_asset()])
+
+
+def test_link_entities_uses_the_assets_exchange_local_active_date() -> None:
+    available_at = datetime(2026, 7, 15, 15, 30, tzinfo=UTC)
+    asset = replace(
+        _asset(),
+        asset_id="asset_7203",
+        symbol="7203",
+        exchange="XJPX",
+        currency="JPY",
+        name="Toyota Motor",
+        active_from=date(2026, 7, 16),
+    )
+    item = replace(
+        _item("Toyota Motor update", "Demand improved."),
+        published_at=available_at,
+        vendor_received_at=available_at,
+        ingested_at=available_at,
+        available_at=available_at,
+    )
+
+    assert link_entities(item, [asset])
 
 
 def test_sentiment_handles_simple_negation() -> None:

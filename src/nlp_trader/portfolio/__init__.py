@@ -1,6 +1,10 @@
 """Deterministic portfolio construction and risk controls."""
 
-from nlp_trader.portfolio.constraints import PortfolioConstraints, constraints_from_config
+from nlp_trader.portfolio.constraints import (
+    PortfolioConstraints,
+    constraints_from_config,
+    round_trip_entry_constraints,
+)
 from nlp_trader.portfolio.construction import (
     PortfolioDecision,
     constrain_target_weights,
@@ -21,4 +25,5 @@ __all__ = [
     "constraints_from_config",
     "construct_portfolio",
     "drift_weights",
+    "round_trip_entry_constraints",
 ]

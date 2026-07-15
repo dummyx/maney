@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import replace
 from typing import Any
 
 from nlp_trader.backtest.costs import (
@@ -13,7 +12,7 @@ from nlp_trader.backtest.costs import (
 from nlp_trader.backtest.metrics import summarize_backtest
 from nlp_trader.config import BacktestConfig
 from nlp_trader.features.build import finite_float
-from nlp_trader.portfolio.constraints import constraints_from_config
+from nlp_trader.portfolio.constraints import constraints_from_config, round_trip_entry_constraints
 from nlp_trader.portfolio.construction import construct_portfolio
 from nlp_trader.portfolio.risk import (
     calculate_exposures,
@@ -148,6 +147,9 @@ def run_backtest(
     predictions: list[dict[str, Any]],
     labels: list[dict[str, Any]],
     config: BacktestConfig,
+    *,
+    top_k: int | None = None,
+    rebalance_offset: int = 0,
 ) -> dict[str, Any]:
     """Replay prediction rows with constrained, cost-aware, deterministic accounting."""
 
@@ -158,7 +160,6 @@ def run_backtest(
         predictions, labels_by_key
     )
 
-    constraints = constraints_from_config(config)
     model = cost_model_from_config(config)
     initial_capital = float(getattr(config, "initial_capital", 1_000_000.0))
     if initial_capital <= 0:
@@ -174,8 +175,12 @@ def run_backtest(
     if len(horizons) > 1:
         raise ValueError("one backtest run must use a single prediction horizon")
     horizon_steps = _horizon_steps(next(iter(horizons), "1d"))
+    if rebalance_offset < 0 or rebalance_offset >= horizon_steps:
+        raise ValueError("rebalance_offset must be within the prediction horizon")
+    constraints = constraints_from_config(config)
+    entry_constraints = round_trip_entry_constraints(config, horizon_steps=horizon_steps)
     all_times = sorted(predictions_by_time, key=parse_utc)
-    times = all_times[::horizon_steps]
+    times = all_times[rebalance_offset::horizon_steps]
     for asof_ts in times:
         period_start_equity = initial_capital * equity
         rows = sorted(predictions_by_time[asof_ts], key=lambda row: str(row["asset_id"]))
@@ -186,20 +191,12 @@ def run_backtest(
         # A one-session round trip enters and exits on the same trading day, so
         # reserve half of the daily turnover budget for each planned leg.  Longer
         # horizons apply the full budget separately on their distinct execution days.
-        portfolio_constraints = constraints
-        if horizon_steps == 1:
-            portfolio_constraints = replace(
-                constraints,
-                max_daily_turnover=config.max_daily_turnover
-                / (2.0 + config.same_day_exit_notional_buffer),
-                max_participation_rate=constraints.max_participation_rate
-                / (1.0 + config.same_day_exit_notional_buffer),
-            )
         decision = construct_portfolio(
             rows,
             before,
-            portfolio_constraints,
+            entry_constraints,
             equity=period_start_equity,
+            top_k=top_k,
         )
         target = decision.target_weights
         before_exposure = calculate_exposures(before, metadata)
@@ -432,6 +429,8 @@ def run_backtest(
             "turnover_denominator": "entry and total round-trip turnover use period-start NAV; "
             "exit_turnover_exit_nav also reports the contemporaneous pre-exit NAV basis",
             "same_day_exit_notional_buffer": config.same_day_exit_notional_buffer,
+            "top_k": top_k,
+            "rebalance_offset": rebalance_offset,
             "unmodeled": [
                 "queue priority",
                 "intraday path between decision timestamps",
@@ -449,8 +448,17 @@ class DeterministicBacktestEngine:
         predictions: list[dict[str, Any]],
         labels: list[dict[str, Any]],
         config: BacktestConfig,
+        *,
+        top_k: int | None = None,
+        rebalance_offset: int = 0,
     ) -> dict[str, Any]:
-        return run_backtest(predictions, labels, config)
+        return run_backtest(
+            predictions,
+            labels,
+            config,
+            top_k=top_k,
+            rebalance_offset=rebalance_offset,
+        )
 
     def summarize(self, result: Mapping[str, Any]) -> dict[str, Any]:
         metrics = result.get("metrics")

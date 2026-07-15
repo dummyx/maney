@@ -61,6 +61,7 @@ def test_yaml_config_is_typed_hashed_and_validated(tmp_path: Path) -> None:
 
     assert config.mode == "sample"
     assert config.paths.assets == (tmp_path / "assets.csv").resolve()
+    assert config.data.schema_version == "2"
     assert len(config.content_hash()) == 64
     assert validate_config(config) == []
 
@@ -88,8 +89,20 @@ def test_daily_pipeline_rejects_open_decisions(tmp_path: Path) -> None:
             "models.families",
         ),
         (
+            lambda value: value.setdefault("models", {}).update(final_holdout_periods=0),
+            "final_holdout_periods",
+        ),
+        (
             lambda value: value["features"].update(horizon_days=2),
             "rebalance_frequency",
+        ),
+        (
+            lambda value: (
+                value["features"].update(horizon_days=2),
+                value["backtest"].update(rebalance_frequency="2d"),
+                value.setdefault("models", {}).update(final_holdout_periods=1),
+            ),
+            "final_holdout_periods",
         ),
         (
             lambda value: value.setdefault("runtime", {}).update(

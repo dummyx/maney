@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import csv
+import json
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from nlp_trader.backtest.engine import DeterministicBacktestEngine
+from nlp_trader.config import BacktestConfig
+from nlp_trader.data.local import asset_to_record, read_assets
+from nlp_trader.data.parquet import write_partitioned_parquet
 from nlp_trader.data.stores import LocalFeatureStore, LocalModelRegistry
 from nlp_trader.providers import (
     BacktestEngine,
@@ -31,6 +37,24 @@ from nlp_trader.schemas import (
 )
 
 
+def _backtest_config() -> BacktestConfig:
+    return BacktestConfig(
+        commission_bps=0.0,
+        half_spread_bps=0.0,
+        slippage_bps=0.0,
+        borrow_bps_per_year=0.0,
+        max_position_weight=0.5,
+        max_gross_exposure=1.0,
+        max_net_exposure=1.0,
+        max_daily_turnover=1.0,
+        max_participation_rate=0.05,
+        min_price=1.0,
+        min_dollar_volume=0.0,
+        shorting_allowed=False,
+        hard_to_borrow_allowed=False,
+    )
+
+
 def test_local_implementations_satisfy_provider_contracts(tmp_path: Path) -> None:
     market = LocalMarketDataProvider(tmp_path / "assets.csv", tmp_path / "bars.csv")
     text = LocalTextDataProvider(tmp_path / "text.jsonl")
@@ -47,6 +71,23 @@ def test_local_implementations_satisfy_provider_contracts(tmp_path: Path) -> Non
     assert isinstance(features, FeatureStore)
     assert isinstance(models, ModelRegistry)
     assert isinstance(backtests, BacktestEngine)
+    typed_backtests: BacktestEngine = backtests
+    result = typed_backtests.run(
+        [],
+        [],
+        _backtest_config(),
+        top_k=1,
+        rebalance_offset=0,
+    )
+    assert result["assumptions"]["top_k"] == 1
+    assert result["assumptions"]["rebalance_offset"] == 0
+
+
+def test_empty_text_jsonl_is_a_valid_market_only_input(tmp_path: Path) -> None:
+    path = tmp_path / "empty.jsonl"
+    path.write_text("", encoding="utf-8")
+
+    assert LocalTextDataProvider(path).fetch_items() == []
 
 
 def test_required_research_schemas_preserve_versions_and_identifiers() -> None:
@@ -92,9 +133,77 @@ def test_required_research_schemas_preserve_versions_and_identifiers() -> None:
     )
 
     assert asset.cik == "0000000001"
+    assert asset.short_available is False
+    assert asset.hard_to_borrow is False
     assert label.label_version == "labels-v1"
     assert prediction.model_version == "model-v1"
     assert intent.risk_flags == ("paper-only",)
+
+
+def test_asset_borrow_fields_reject_non_booleans_and_fail_closed_when_htb_is_missing() -> None:
+    def asset_with_borrow_fields(
+        *, short_available: Any = False, hard_to_borrow: Any = None
+    ) -> Asset:
+        return Asset(
+            asset_id="asset_aaa",
+            symbol="AAA",
+            exchange="XNAS",
+            currency="USD",
+            name="Alpha Analytics",
+            sector="Technology",
+            active_from=date(2026, 1, 1),
+            active_to=None,
+            short_available=short_available,
+            hard_to_borrow=hard_to_borrow,
+        )
+
+    with pytest.raises(ValueError, match="short_available must be a boolean"):
+        asset_with_borrow_fields(short_available="false")
+    with pytest.raises(ValueError, match="hard_to_borrow must be a boolean"):
+        asset_with_borrow_fields(hard_to_borrow="false")
+
+    shortable = asset_with_borrow_fields(short_available=True)
+    assert shortable.hard_to_borrow is True
+
+
+@pytest.mark.parametrize("storage_format", ["csv", "json", "parquet"])
+@pytest.mark.parametrize("omit_hard_to_borrow", [False, True])
+def test_asset_borrow_fields_round_trip_through_local_providers(
+    tmp_path: Path,
+    storage_format: str,
+    omit_hard_to_borrow: bool,
+) -> None:
+    asset = Asset(
+        asset_id="asset_aaa",
+        symbol="AAA",
+        exchange="XNAS",
+        currency="USD",
+        name="Alpha Analytics",
+        sector="Technology",
+        active_from=date(2026, 1, 1),
+        active_to=None,
+        short_available=True,
+        hard_to_borrow=True,
+    )
+    record = asset_to_record(asset)
+    if omit_hard_to_borrow:
+        record.pop("hard_to_borrow")
+    if storage_format == "csv":
+        assets_path = tmp_path / "assets.csv"
+        with assets_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(record))
+            writer.writeheader()
+            writer.writerow(record)
+        assert read_assets(assets_path) == [asset]
+    elif storage_format == "json":
+        assets_path = tmp_path / "assets.json"
+        assets_path.write_text(json.dumps([record]), encoding="utf-8")
+    else:
+        assets_path = tmp_path / "assets"
+        write_partitioned_parquet([record], assets_path)
+
+    provider = LocalMarketDataProvider(assets_path, tmp_path / "unused-bars.csv")
+    assert provider.fetch_assets() == [asset]
 
 
 def test_boundary_schemas_reject_invalid_market_and_text_records() -> None:

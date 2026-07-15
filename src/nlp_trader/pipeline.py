@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import time as clock
+from bisect import bisect_left
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -21,16 +23,33 @@ from nlp_trader.data.stores import (
     RawIngestionRequest,
 )
 from nlp_trader.features.build import build_feature_rows, build_label_rows
+from nlp_trader.market_timing import (
+    market_bar_available_at,
+    market_decision_time_for_bar,
+    market_decision_times_by_session,
+)
 from nlp_trader.models.baselines import predict_all_families, train_baselines
 from nlp_trader.models.evaluation import evaluate_predictions
+from nlp_trader.nlp.llm_annotations import (
+    AnnotationRequest,
+    AnnotationResponse,
+    AssetCandidate,
+    CachedLocalLLMAnnotator,
+    EntityAnnotation,
+    GenerationRequest,
+    GenerationResponse,
+    LLMAnnotationConfig,
+    build_annotation_request,
+)
 from nlp_trader.nlp.simple import build_text_signals, link_entities
 from nlp_trader.nlp.transformer import (
     CachedTransformerSentiment,
     TransformerSentimentConfig,
 )
+from nlp_trader.paper.ledger import PaperEventLedger
 from nlp_trader.paper.simulator import PaperOrderIntent
-from nlp_trader.portfolio.constraints import constraints_from_config
-from nlp_trader.portfolio.construction import constrain_target_weights
+from nlp_trader.portfolio.constraints import constraint_snapshot, round_trip_entry_constraints
+from nlp_trader.portfolio.construction import construct_portfolio
 from nlp_trader.portfolio.risk import conservative_risk_estimates, risk_estimate_flags
 from nlp_trader.providers import (
     LocalFundamentalsProvider,
@@ -57,9 +76,12 @@ from nlp_trader.timestamps import format_utc, parse_utc
 
 LOGGER = logging.getLogger(__name__)
 
+LLMGenerator = Callable[[list[GenerationRequest]], list[GenerationResponse]]
+
 STAGES = (
     "ingest_market",
     "ingest_text",
+    "annotate_text",
     "build_features",
     "build_labels",
     "train",
@@ -72,7 +94,8 @@ STAGES = (
 DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "ingest_market": (),
     "ingest_text": (),
-    "build_features": ("ingest_market", "ingest_text"),
+    "annotate_text": ("ingest_market", "ingest_text"),
+    "build_features": ("annotate_text",),
     "build_labels": ("ingest_market",),
     "train": ("build_features", "build_labels"),
     "predict": ("train",),
@@ -87,6 +110,15 @@ def _write_json_once(path: Path, value: object) -> Path:
     with path.open("x", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    return path
+
+
+def _write_text_once(path: Path, value: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(value)
+        if not value.endswith("\n"):
+            handle.write("\n")
     return path
 
 
@@ -165,26 +197,33 @@ class PipelineExecution:
         self,
         config: ResearchConfig,
         context: RunContext,
+        *,
+        llm_generator: LLMGenerator | None = None,
     ) -> None:
         self.config = config
         self.context = context
         self.enable_transformer_sentiment = config.transformer.enabled
+        self.llm_generator = llm_generator
         self.outputs: dict[str, Any] = {"run_id": context.run_id}
         self.completed: set[str] = set()
         self.assets: list[Asset] = []
         self.bars: list[MarketBar] = []
         self.items: list[TextItem] = []
+        self.llm_annotations: dict[tuple[str, str], EntityAnnotation] = {}
+        self.llm_annotation_summary: dict[str, Any] = {}
         self.signals: list[TextSignal] = []
         self.fundamentals: list[FundamentalRecord] = []
         self.earnings_events: list[EarningsCalendarEvent] = []
         self.corporate_actions: list[CorporateAction] = []
         self.selected_decision_times: frozenset[datetime] | None = None
+        self.market_decision_times_by_session: dict[date, datetime] = {}
         self.features: list[dict[str, Any]] = []
         self.labels: list[dict[str, Any]] = []
         self.model: dict[str, Any] = {}
         self.predictions: dict[str, list[dict[str, Any]]] = {}
         self.evaluation: dict[str, Any] = {}
         self.backtests: dict[str, dict[str, Any]] = {}
+        self.final_holdout_backtests: dict[str, dict[str, Any]] = {}
 
     @property
     def symbols(self) -> tuple[str, ...] | None:
@@ -223,11 +262,11 @@ class PipelineExecution:
         if self.start is None:
             return None
         calendar = self._runtime_context_calendar()
-        first_decision = min(
-            value
-            for value in self._nearby_decision_closes(calendar, self.start)
-            if value >= self.start
-        )
+        nearby_closes = self._nearby_decision_closes(calendar, self.start)
+        if self.config.data.market_contract == "japan_cash_equity_v1":
+            first_decision = max(value for value in nearby_closes if value <= self.start)
+        else:
+            first_decision = min(value for value in nearby_closes if value >= self.start)
         session_date = first_decision.astimezone(calendar.timezone).date()
         for _ in range(self.config.features.market_warmup_sessions):
             session_date = calendar.previous_session(session_date)
@@ -242,7 +281,10 @@ class PipelineExecution:
             value for value in self._nearby_decision_closes(calendar, anchor) if value <= anchor
         )
         session_date = last_decision.astimezone(calendar.timezone).date()
-        for _ in range(self.config.features.horizon_days):
+        future_sessions = self.config.features.horizon_days
+        if self.config.data.market_contract == "japan_cash_equity_v1":
+            future_sessions += 1
+        for _ in range(future_sessions):
             session_date = calendar.next_session(session_date)
         return calendar.session_close(session_date)
 
@@ -277,7 +319,25 @@ class PipelineExecution:
         )
 
     def _decision_bars(self) -> list[MarketBar]:
-        return [bar for bar in self.bars if self._is_decision_timestamp(bar.ts)]
+        if not self.bars:
+            return []
+        calendar = self._calendar()
+        if not self.market_decision_times_by_session:
+            self.market_decision_times_by_session = market_decision_times_by_session(
+                self.bars,
+                calendar.timezone,
+            )
+        return [
+            bar
+            for bar in self.bars
+            if self._is_decision_timestamp(
+                market_decision_time_for_bar(
+                    bar,
+                    self.market_decision_times_by_session,
+                    calendar.timezone,
+                )
+            )
+        ]
 
     def _assets_by_id(self) -> dict[str, Asset]:
         indexed: dict[str, Asset] = {}
@@ -340,6 +400,7 @@ class PipelineExecution:
             self._captured_input_path("assets", self.config.paths.assets, references),
             self.config.paths.market_bars,
             self.config.paths.corporate_actions,
+            market_contract=self.config.data.market_contract,
         )
         self.assets = provider.fetch_assets(symbols=self.symbols)
         if not self.assets:
@@ -370,6 +431,7 @@ class PipelineExecution:
                         "start_date": self.config.runtime.start_date,
                         "end_date": self.config.runtime.end_date,
                         "limit": self.config.runtime.limit,
+                        "market_contract": self.config.data.market_contract,
                         "input_relative_path": relative,
                     },
                 ),
@@ -469,6 +531,7 @@ class PipelineExecution:
             self._captured_input_path("assets", self.config.paths.assets, asset_refs),
             self._captured_input_path("market_bars", self.config.paths.market_bars, bar_refs),
             captured_optional.get("corporate_actions"),
+            market_contract=self.config.data.market_contract,
         )
         if self.config.runtime.limit is not None:
             selected = provider.fetch_decision_times(
@@ -488,6 +551,11 @@ class PipelineExecution:
             limit=None,
         )
         self.bars.sort(key=lambda bar: (bar.ts, bar.symbol))
+        market_calendar = self._calendar()
+        self.market_decision_times_by_session = market_decision_times_by_session(
+            self.bars,
+            market_calendar.timezone,
+        )
         self.corporate_actions = provider.fetch_corporate_actions(
             symbols=self.symbols,
             start=self._decision_data_start(),
@@ -662,8 +730,232 @@ class PipelineExecution:
             }
         )
 
+    def annotate_text(self) -> None:
+        configured = self.config.llm_annotations
+        if not configured.enabled:
+            return
+        model_path = self.config.paths.llm_model
+        if (
+            model_path is None
+            or not configured.model_id
+            or not configured.model_revision
+            or not configured.model_license_or_terms_ref
+        ):
+            raise ValueError("enabled LLM annotations require a local model path and identity")
+
+        annotator = CachedLocalLLMAnnotator(
+            LLMAnnotationConfig(
+                model_path=model_path,
+                model_id=configured.model_id,
+                model_revision=configured.model_revision,
+                model_license_or_terms_ref=configured.model_license_or_terms_ref,
+                prompt_version=configured.prompt_version,
+                schema_version=configured.schema_version,
+                cache_dir=self.config.paths.models_dir / "_cache" / "llm_annotations",
+                batch_size=configured.batch_size,
+                max_input_tokens=configured.max_input_tokens,
+                max_new_tokens=configured.max_new_tokens,
+                decoding=configured.decoding,
+                seed=configured.seed,
+                local_files_only=configured.local_files_only,
+                trust_remote_code=configured.trust_remote_code,
+            ),
+            generator=self.llm_generator,
+        )
+        model_manifest = next(
+            (entry for entry in self.context.inputs if entry["role"] == "llm_model"),
+            None,
+        )
+        if model_manifest is None or not model_manifest.get("sha256"):
+            raise ValueError("run input manifest is missing the enabled local LLM model hash")
+        loaded_model_hash = annotator.provenance_payload.get("model_directory_sha256")
+        if loaded_model_hash != model_manifest["sha256"]:
+            raise ValueError("configured local LLM model changed after run input capture")
+        assets_by_id = self._assets_by_id()
+        calendar = self._calendar()
+        requests: list[AnnotationRequest] = []
+        expected_assets: dict[str, tuple[str, ...]] = {}
+        for item in sorted(self.items, key=lambda value: (value.available_at, value.item_id)):
+            item_date = item.available_at.astimezone(calendar.timezone).date()
+            candidate_assets: set[str] = set()
+            for entity in item.entities:
+                if entity.asset_id is None:
+                    continue
+                asset = assets_by_id.get(entity.asset_id)
+                if asset is None:
+                    continue
+                if asset.active_from is not None and item_date < asset.active_from:
+                    continue
+                if asset.active_to is not None and item_date > asset.active_to:
+                    continue
+                candidate_assets.add(entity.asset_id)
+            if not candidate_assets:
+                continue
+            candidates = tuple(
+                AssetCandidate(
+                    asset_id=asset_id,
+                    symbol=assets_by_id[asset_id].symbol,
+                    name=assets_by_id[asset_id].name,
+                )
+                for asset_id in sorted(candidate_assets)
+            )
+            request = build_annotation_request(item, candidates)
+            requests.append(request)
+            expected_assets[item.item_id] = tuple(candidate.asset_id for candidate in candidates)
+
+        responses = annotator.annotate(requests)
+        responses_by_item: dict[str, AnnotationResponse] = {}
+        for response in responses:
+            if response.item_id in responses_by_item:
+                raise ValueError(f"duplicate LLM annotation response for item: {response.item_id}")
+            expected = expected_assets.get(response.item_id)
+            if expected is None:
+                raise ValueError(
+                    f"LLM annotation response references unknown item: {response.item_id}"
+                )
+            observed = tuple(annotation.asset_id for annotation in response.annotations)
+            if len(observed) != len(set(observed)) or set(observed) != set(expected):
+                raise ValueError(
+                    f"LLM annotation assets do not match candidates for item: {response.item_id}"
+                )
+            responses_by_item[response.item_id] = response
+        if set(responses_by_item) != set(expected_assets):
+            missing = sorted(set(expected_assets) - set(responses_by_item))
+            raise ValueError("LLM annotation responses missing items: " + ", ".join(missing))
+
+        item_by_id = {item.item_id: item for item in self.items}
+        artifact_root = self.context.paths.models / "llm_annotations"
+        prompt_path = _write_text_once(artifact_root / "prompt.txt", annotator.prompt_text)
+        schema_path = _write_json_once(artifact_root / "schema.json", annotator.schema_payload)
+        annotation_stage_completed_at = datetime.now(UTC)
+        provenance = dict(annotator.provenance_payload)
+        provenance.update(
+            {
+                "run_id": self.context.run_id,
+                "model_directory_sha256": model_manifest["sha256"],
+                "model_license_or_terms_ref": configured.model_license_or_terms_ref,
+                "apply_to_features": configured.apply_to_features,
+                "retrospective_parser": True,
+                "source_availability_policy": (
+                    "annotations inherit each source item's available_at; annotation stage "
+                    "completion time is audit metadata and is not historical feature availability"
+                ),
+                "annotation_stage_completed_at": format_utc(annotation_stage_completed_at),
+                "cache_hit_count": annotator.cache_hit_count,
+                "generation_request_count": annotator.generation_request_count,
+                "deduplicated_request_count": annotator.deduplicated_request_count,
+            }
+        )
+        provenance_path = _write_json_once(
+            artifact_root / "provenance.json",
+            provenance,
+        )
+
+        requests_by_cache_key: dict[str, list[AnnotationRequest]] = {}
+        for request in requests:
+            requests_by_cache_key.setdefault(annotator.cache_key_for(request), []).append(request)
+        response_paths: list[str] = []
+        for cache_key, matching_requests in sorted(requests_by_cache_key.items()):
+            cache_record = annotator.cache_record_for(matching_requests[0])
+            cache_record["run_request"] = {
+                "item_ids": [request.item_id for request in matching_requests]
+            }
+            response_path = _write_json_once(
+                artifact_root / "responses" / f"{cache_key}.json",
+                cache_record,
+            )
+            response_paths.append(str(response_path))
+
+        annotation_records: list[dict[str, Any]] = []
+        for request in requests:
+            response = responses_by_item[request.item_id]
+            item = item_by_id[request.item_id]
+            for annotation in response.annotations:
+                asset = assets_by_id[annotation.asset_id]
+                key = (request.item_id, annotation.asset_id)
+                if key in self.llm_annotations:
+                    raise ValueError(
+                        "duplicate LLM annotation for item and asset: "
+                        f"{request.item_id}, {annotation.asset_id}"
+                    )
+                self.llm_annotations[key] = annotation
+                annotation_records.append(
+                    {
+                        "item_id": request.item_id,
+                        "asset_id": annotation.asset_id,
+                        "symbol": asset.symbol,
+                        "available_at": format_utc(item.available_at),
+                        "stance_label": annotation.stance_label,
+                        "stance_confidence": annotation.stance_confidence,
+                        "uncertainty": annotation.uncertainty,
+                        "primary_event_type": annotation.primary_event_type,
+                        "event_confidence": annotation.event_confidence,
+                        "evidence_span_ids": annotation.evidence_span_ids,
+                        "abstain_reason": annotation.abstain_reason,
+                        "model_id": configured.model_id,
+                        "model_revision": configured.model_revision,
+                        "prompt_version": configured.prompt_version,
+                        "schema_version": configured.schema_version,
+                        "model_directory_sha256": model_manifest["sha256"],
+                        "retrospective_parser": True,
+                        "year": item.available_at.year,
+                    }
+                )
+
+        silver_paths = write_partitioned_parquet(
+            annotation_records,
+            self.context.paths.processed / "silver" / "llm_annotations",
+            partition_fields=("symbol", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        abstentions = sum(record["stance_label"] == "abstain" for record in annotation_records)
+        cited_annotations = sum(bool(record["evidence_span_ids"]) for record in annotation_records)
+        self.llm_annotation_summary = {
+            "artifact_schema_version": "llm-annotation-summary-v1",
+            "enabled": True,
+            "apply_to_features": configured.apply_to_features,
+            "retrospective_parser": True,
+            "text_item_count": len(self.items),
+            "request_count": len(requests),
+            "annotation_count": len(annotation_records),
+            "non_abstention_count": len(annotation_records) - abstentions,
+            "abstention_count": abstentions,
+            "abstention_rate": (
+                abstentions / len(annotation_records) if annotation_records else 0.0
+            ),
+            "cited_annotation_count": cited_annotations,
+            "event_annotation_count": sum(
+                record["primary_event_type"] is not None for record in annotation_records
+            ),
+            "invalid_response_count": 0,
+            "cache_hit_count": annotator.cache_hit_count,
+            "generation_request_count": annotator.generation_request_count,
+            "deduplicated_request_count": annotator.deduplicated_request_count,
+            "model_id": configured.model_id,
+            "model_revision": configured.model_revision,
+            "prompt_version": configured.prompt_version,
+            "schema_version": configured.schema_version,
+            "model_directory_sha256": model_manifest["sha256"],
+        }
+        summary_path = _write_json_once(
+            self.context.paths.processed / "evaluation" / "llm_annotation_summary.json",
+            self.llm_annotation_summary,
+        )
+        self.outputs.update(
+            {
+                "llm_annotation_prompt": prompt_path,
+                "llm_annotation_schema": schema_path,
+                "llm_annotation_provenance": provenance_path,
+                "llm_annotation_responses": response_paths,
+                "llm_annotations": [str(path) for path in silver_paths],
+                "llm_annotation_summary": summary_path,
+            }
+        )
+
     def _calendar(self) -> USEquityCalendar:
         dates = [bar.ts.date() for bar in self.bars]
+        dates.extend(market_bar_available_at(bar).date() for bar in self.bars)
         dates.extend(item.available_at.date() for item in self.items)
         if not dates:
             today = self.context.created_at.date()
@@ -701,14 +993,50 @@ class PipelineExecution:
 
     def build_features(self) -> None:
         calendar = self._calendar()
+        market_decision_times = sorted(self.market_decision_times_by_session.values())
         transformer_results = self._transformer_results()
         raw_signals = build_text_signals(self.items, self.assets)
         self.signals = []
         for signal in raw_signals:
-            decision_time = calendar.next_decision_time(signal.asof_ts)
+            decision_index = bisect_left(
+                market_decision_times,
+                signal.asof_ts.astimezone(UTC),
+            )
+            decision_time = (
+                market_decision_times[decision_index]
+                if decision_index < len(market_decision_times)
+                else calendar.next_decision_time(signal.asof_ts)
+            )
             transformer_result = transformer_results.get(signal.item_id)
+            llm_annotation = self.llm_annotations.get((signal.item_id, signal.asset_id))
             overrides: dict[str, Any] = {"asof_ts": decision_time}
-            if transformer_result is not None:
+            if (
+                self.config.llm_annotations.apply_to_features
+                and llm_annotation is not None
+                and llm_annotation.stance_label != "abstain"
+            ):
+                direction = {
+                    "positive": 1.0,
+                    "negative": -1.0,
+                    "neutral": 0.0,
+                }[llm_annotation.stance_label]
+                overrides.update(
+                    {
+                        "sentiment_score": direction * llm_annotation.stance_confidence,
+                        "sentiment_label": llm_annotation.stance_label,
+                        "sentiment_confidence": llm_annotation.stance_confidence,
+                        "event_type": llm_annotation.primary_event_type,
+                        "model_version": (
+                            f"llm:{self.config.llm_annotations.model_id}@"
+                            f"{self.config.llm_annotations.model_revision}:"
+                            f"{self.config.llm_annotations.prompt_version}:"
+                            f"{self.config.llm_annotations.schema_version}"
+                        ),
+                    }
+                )
+            elif (
+                not self.config.llm_annotations.apply_to_features and transformer_result is not None
+            ):
                 score, label, confidence = transformer_result
                 overrides.update(
                     {
@@ -735,8 +1063,8 @@ class PipelineExecution:
             row["beta"] = row.get("market_beta_60d")
             row["volatility"] = row.get("realized_volatility_20d")
             row.update(conservative_risk_estimates(row, self.config.backtest))
-            row["short_available"] = False
-            row["hard_to_borrow"] = False
+            row.setdefault("short_available", False)
+            row.setdefault("hard_to_borrow", False)
         signal_records: list[dict[str, Any]] = []
         for signal in self.signals:
             record = _signal_to_record(signal)
@@ -787,6 +1115,7 @@ class PipelineExecution:
             model_version=self.config.features.model_version,
             min_train_rows=self.config.models.min_train_rows,
             embargo_periods=self.config.models.embargo_periods,
+            final_holdout_periods=self.config.models.final_holdout_periods,
         )
         registry = LocalModelRegistry(self.context.paths.models)
         path = registry.save_model(
@@ -822,6 +1151,8 @@ class PipelineExecution:
             self.labels,
             context_rows=self.features,
             top_k=self.config.models.top_k,
+            final_holdout_periods=self.config.models.final_holdout_periods,
+            final_holdout_training=self.model["final_holdout_training"],
         )
         registry = LocalModelRegistry(self.context.paths.models)
         registry.record_metrics(self.config.features.model_version, self.evaluation)
@@ -833,20 +1164,120 @@ class PipelineExecution:
 
     def backtest(self) -> None:
         engine = DeterministicBacktestEngine()
+        protocol = self.evaluation.get("evaluation_protocol", {})
+        holdout_start_value = protocol.get("final_holdout_start")
+        if not isinstance(holdout_start_value, str):
+            raise ValueError("backtesting requires a configured chronological final holdout")
+        holdout_start = parse_utc(holdout_start_value)
+        purged_times = {str(value) for value in protocol.get("purged_development_times", [])}
+        pre_holdout_periods = int(protocol.get("pre_holdout_periods", 0))
+        horizon_steps = self.config.features.horizon_days
+        holdout_rebalance_offset = (-pre_holdout_periods) % horizon_steps
         for family, rows in sorted(self.predictions.items()):
-            result = engine.run(rows, self.labels, self.config.backtest)
-            self.backtests[family] = result
+            selection_depth = (
+                None if family in {"equal_weight", "no_trade"} else self.config.models.top_k
+            )
+            development_rows = [
+                row
+                for row in rows
+                if parse_utc(str(row["asof_ts"])) < holdout_start
+                and str(row["asof_ts"]) not in purged_times
+            ]
+            holdout_rows = [row for row in rows if parse_utc(str(row["asof_ts"])) >= holdout_start]
+            if not development_rows or not holdout_rows:
+                raise ValueError("backtest holdout split must contain both evaluation windows")
+            development_result = engine.run(
+                development_rows,
+                self.labels,
+                self.config.backtest,
+                top_k=selection_depth,
+            )
+            holdout_result = engine.run(
+                holdout_rows,
+                self.labels,
+                self.config.backtest,
+                top_k=selection_depth,
+                rebalance_offset=holdout_rebalance_offset,
+            )
+            development_result["evaluation_window"] = {
+                "name": "development",
+                "end_exclusive": holdout_start_value,
+            }
+            holdout_result["evaluation_window"] = {
+                "name": "final_holdout",
+                "start_inclusive": holdout_start_value,
+            }
+            self.backtests[family] = development_result
+            self.final_holdout_backtests[family] = holdout_result
             _write_json_once(
                 self.context.paths.processed / "backtests" / family / "backtest.json",
-                result,
+                development_result,
             )
+            _write_json_once(
+                self.context.paths.processed / "backtests" / family / "final_holdout.json",
+                holdout_result,
+            )
+        provenance = {
+            "run_id": self.context.run_id,
+            "created_at": format_utc(self.context.created_at),
+            "config_hash": self.config.content_hash(),
+            "code_version": self.context.code,
+            "input_manifest": [
+                {
+                    "role": entry["role"],
+                    "sha256": entry.get("sha256"),
+                    "exists": entry["exists"],
+                }
+                for entry in self.context.inputs
+            ],
+            "feature_set_version": self.config.features.feature_set_version,
+            "label_version": self.config.features.label_version,
+            "model_version": self.config.features.model_version,
+        }
+        comparison_assumptions = {
+            "horizon_steps": horizon_steps,
+            "rebalance_frequency": self.config.backtest.rebalance_frequency,
+            "top_k": self.config.models.top_k,
+            "uncapped_families": ["equal_weight", "no_trade"],
+            "portfolio_ranking": "direction eligibility, then absolute score, then asset_id",
+            "costs_and_constraints": self.config.backtest.model_dump(mode="json"),
+        }
         comparison = {
-            family: result["metrics"] for family, result in sorted(self.backtests.items())
+            "artifact_schema_version": "backtest-comparison-v2",
+            "provenance": provenance,
+            "assumptions": comparison_assumptions,
+            "evaluation_window": {
+                "name": "development",
+                "end_exclusive": holdout_start_value,
+            },
+            "evaluation_protocol": protocol,
+            "families": {
+                family: result["metrics"] for family, result in sorted(self.backtests.items())
+            },
+        }
+        holdout_comparison = {
+            "artifact_schema_version": "backtest-comparison-v2",
+            "provenance": provenance,
+            "assumptions": comparison_assumptions,
+            "evaluation_window": {
+                "name": "final_holdout",
+                "start_inclusive": holdout_start_value,
+                "end_inclusive": protocol.get("final_holdout_end"),
+            },
+            "evaluation_protocol": protocol,
+            "families": {
+                family: result["metrics"]
+                for family, result in sorted(self.final_holdout_backtests.items())
+            },
         }
         self.outputs["backtests"] = str(self.context.paths.processed / "backtests")
         self.outputs["backtest_comparison"] = _write_json_once(
             self.context.paths.processed / "evaluation" / "backtest_comparison.json",
             comparison,
+        )
+        self.outputs["final_holdout_backtest_comparison"] = _write_json_once(
+            self.context.paths.processed / "evaluation" / "final_holdout_backtest_comparison.json",
+            holdout_comparison,
         )
 
     def paper(self) -> None:
@@ -860,18 +1291,29 @@ class PipelineExecution:
                 parse_utc(latest_ts) + timedelta(microseconds=1)
             )
         )
-        ranked = sorted(latest, key=lambda row: float(row["score"]), reverse=True)
-        selected = [row for row in ranked if float(row["score"]) > 0][: self.config.models.top_k]
-        desired = {
-            str(row["asset_id"]): self.config.backtest.max_position_weight for row in selected
+        horizon_steps = self.config.features.horizon_days
+        entry_constraints = round_trip_entry_constraints(
+            self.config.backtest,
+            horizon_steps=horizon_steps,
+        )
+        paper_protocol = {
+            "run_id": self.context.run_id,
+            "config_hash": self.config.content_hash(),
+            "feature_set_version": self.config.features.feature_set_version,
+            "model_version": self.config.features.model_version,
+            "horizon_steps": horizon_steps,
+            "top_k": self.config.models.top_k,
+            "same_day_exit_notional_buffer": (self.config.backtest.same_day_exit_notional_buffer),
+            "effective_entry_constraints": constraint_snapshot(entry_constraints),
         }
-        decision = constrain_target_weights(
-            desired,
+        decision = construct_portfolio(
             latest,
             {},
-            constraints_from_config(self.config.backtest),
+            entry_constraints,
             equity=self.config.backtest.initial_capital,
+            top_k=self.config.models.top_k,
         )
+        desired = dict(decision.target_weights)
         intents = [
             PaperOrderIntent(
                 strategy_id="combined-research-paper",
@@ -879,10 +1321,14 @@ class PipelineExecution:
                 asset_id=str(row["asset_id"]),
                 symbol=str(row["symbol"]),
                 target_weight=decision.target_weights.get(str(row["asset_id"]), 0.0),
-                side="BUY"
-                if decision.target_weights.get(str(row["asset_id"]), 0.0) > 0
-                else "FLAT",
-                reason_codes=("combined_score_positive",)
+                side=(
+                    "BUY"
+                    if decision.target_weights.get(str(row["asset_id"]), 0.0) > 0
+                    else "SHORT"
+                    if decision.target_weights.get(str(row["asset_id"]), 0.0) < 0
+                    else "FLAT"
+                ),
+                reason_codes=("combined_score_selected",)
                 if str(row["asset_id"]) in desired
                 else ("not_selected",),
             )
@@ -896,6 +1342,7 @@ class PipelineExecution:
             "intended_execution_ts": intended_execution_ts,
             "initial_capital": self.config.backtest.initial_capital,
             "equity": self.config.backtest.initial_capital,
+            "research_protocol": paper_protocol,
             "positions": {},
             "trades": [],
             "intents": [
@@ -930,6 +1377,24 @@ class PipelineExecution:
             "execution_note": "simulation-only next-session-open intent; no broker order, "
             "fill, cost, cash, or position mutation has occurred",
         }
+        ledger_path = self.context.paths.processed / "paper" / "events.jsonl"
+        ledger_event = PaperEventLedger(ledger_path).append(
+            {
+                "event_type": "paper_intent_batch",
+                "asof_ts": intended_execution_ts,
+                "simulation_only": True,
+                "status": snapshot["status"],
+                "decision_ts": latest_ts,
+                "research_protocol": paper_protocol,
+                "intents": snapshot["intents"],
+                "portfolio_risk_flags": snapshot["portfolio_risk_flags"],
+            }
+        )
+        snapshot["ledger"] = {
+            "path": str(ledger_path),
+            "sequence": ledger_event["sequence"],
+            "event_hash": ledger_event["event_hash"],
+        }
         self.outputs["paper"] = _write_json_once(
             self.context.paths.processed / "paper" / "snapshot.json",
             snapshot,
@@ -944,7 +1409,13 @@ class PipelineExecution:
             "portfolio": {
                 family: result["metrics"] for family, result in sorted(self.backtests.items())
             },
+            "portfolio_final_holdout": {
+                family: result["metrics"]
+                for family, result in sorted(self.final_holdout_backtests.items())
+            },
         }
+        if self.llm_annotation_summary:
+            evaluation["llm_annotations"] = self.llm_annotation_summary
         path = write_report(
             self.config,
             primary,
@@ -965,13 +1436,37 @@ class PipelineExecution:
         decision_bars = self._decision_bars()
         if not decision_bars:
             return {"start": None, "end": None}
-        timestamps = [bar.ts for bar in decision_bars]
+        calendar = self._calendar()
+        timestamps = [
+            market_decision_time_for_bar(
+                bar,
+                self.market_decision_times_by_session,
+                calendar.timezone,
+            )
+            for bar in decision_bars
+        ]
         return {"start": format_utc(min(timestamps)), "end": format_utc(max(timestamps))}
 
     def limitations(self) -> list[str]:
         values = list(DEFAULT_LIMITATIONS)
-        if not self.enable_transformer_sentiment:
+        if self.config.llm_annotations.enabled:
+            values.append(
+                "LLM annotations are retrospective, source-grounded parsing; the "
+                "model may retain facts learned during pretraining after the historical period."
+            )
+        if (
+            not self.config.llm_annotations.apply_to_features
+            and not self.enable_transformer_sentiment
+        ):
             values.append("Text sentiment uses a deterministic finance dictionary baseline.")
+        if (
+            self.config.llm_annotations.enabled
+            and not self.config.llm_annotations.apply_to_features
+        ):
+            values.append(
+                "LLM annotations are sidecar-only in this run and do not affect features or "
+                "research results."
+            )
         if self.config.mode == "sample":
             values.append("No sample metric is evidence of investment profitability.")
         return values
@@ -987,19 +1482,29 @@ class PipelineExecution:
 
     def final_metrics(self) -> dict[str, Any]:
         if self.backtests:
-            return {
+            metrics: dict[str, Any] = {
                 "prediction": self.evaluation,
                 "portfolio": {
                     family: result["metrics"] for family, result in sorted(self.backtests.items())
                 },
+                "portfolio_final_holdout": {
+                    family: result["metrics"]
+                    for family, result in sorted(self.final_holdout_backtests.items())
+                },
             }
-        return {
+            if self.llm_annotation_summary:
+                metrics["llm_annotations"] = self.llm_annotation_summary
+            return metrics
+        metrics = {
             "assets": len(self.assets),
             "bars": len(self._decision_bars()),
             "text_items": len(self.items),
             "features": len(self.features),
             "labels": len(self.labels),
         }
+        if self.llm_annotation_summary:
+            metrics["llm_annotations"] = self.llm_annotation_summary
+        return metrics
 
 
 def validate(config: ResearchConfig) -> dict[str, Any]:
@@ -1010,6 +1515,8 @@ def validate(config: ResearchConfig) -> dict[str, Any]:
 def run_to_stage(
     config: ResearchConfig,
     stage: str,
+    *,
+    llm_generator: LLMGenerator | None = None,
 ) -> dict[str, Any]:
     target = "report" if stage == "smoke" else stage.replace("-", "_")
     if target not in DEPENDENCIES:
@@ -1027,6 +1534,7 @@ def run_to_stage(
     execution = PipelineExecution(
         config,
         context,
+        llm_generator=llm_generator,
     )
     try:
         execution.run(target)
@@ -1056,33 +1564,69 @@ def ingest_text(config: ResearchConfig) -> dict[str, Any]:
     return run_to_stage(config, "ingest_text")
 
 
-def build_features(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "build_features")
+def annotate_text(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "annotate_text", llm_generator=llm_generator)
+
+
+def build_features(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "build_features", llm_generator=llm_generator)
 
 
 def build_labels(config: ResearchConfig) -> dict[str, Any]:
     return run_to_stage(config, "build_labels")
 
 
-def train(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "train")
+def train(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "train", llm_generator=llm_generator)
 
 
-def predict(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "predict")
+def predict(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "predict", llm_generator=llm_generator)
 
 
-def backtest(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "backtest")
+def backtest(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "backtest", llm_generator=llm_generator)
 
 
-def paper(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "paper")
+def paper(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "paper", llm_generator=llm_generator)
 
 
-def report(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "report")
+def report(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "report", llm_generator=llm_generator)
 
 
-def smoke(config: ResearchConfig) -> dict[str, Any]:
-    return run_to_stage(config, "smoke")
+def smoke(
+    config: ResearchConfig,
+    *,
+    llm_generator: LLMGenerator | None = None,
+) -> dict[str, Any]:
+    return run_to_stage(config, "smoke", llm_generator=llm_generator)

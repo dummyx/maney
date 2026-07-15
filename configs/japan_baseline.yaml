@@ -1,31 +1,34 @@
 mode: full
 paths:
-  assets: ../data/local/assets.csv
-  market_bars: ../data/local/market_bars.parquet
-  text_items: ../data/local/text_items.parquet
+  assets: ../data/local/japan/assets.csv
+  market_bars: ../data/local/japan/market_bars.parquet
+  text_items: ../data/local/japan/text_items.jsonl
   raw_dir: ../data/raw
-  interim_dir: ../data/interim/local
-  processed_dir: ../data/processed/local
-  models_dir: ../models/local
-  reports_dir: ../reports/local
+  interim_dir: ../data/interim/japan-baseline
+  processed_dir: ../data/processed/japan-baseline
+  models_dir: ../models/japan-baseline
+  reports_dir: ../reports/japan-baseline
   llm_model: null
 data:
   storage_format: parquet
   compression: zstd
   write_batch_rows: 10000
-  calendar: XNYS
-  schema_version: "2"
-  market_license_or_terms_ref: user-provided-local
-  text_license_or_terms_ref: user-provided-local
+  calendar: XJPX
+  market_contract: japan_cash_equity_v1
+  schema_version: japan-cash-equity-v1
+  # Replace both placeholders with human-resolvable terms or license records for
+  # the exact local exports before treating a run as substantive research.
+  market_license_or_terms_ref: user-provided-local-replace-with-market-terms
+  text_license_or_terms_ref: user-provided-local-replace-with-text-terms
 features:
   windows_days: [1, 3, 5, 20]
   market_warmup_sessions: 60
   text_warmup_days: 40
   event_lookahead_days: 30
   horizon_days: 1
-  feature_set_version: local-v3
-  label_version: local-v2
-  model_version: local-walk-forward-v3
+  feature_set_version: japan-baseline-v1
+  label_version: japan-baseline-v1
+  model_version: japan-walk-forward-v1
   text_decay_half_life_days: 1.0
   decision_time: close
 models:
@@ -33,30 +36,30 @@ models:
   min_train_rows: 252
   embargo_periods: 1
   final_holdout_periods: 20
-  top_k: 20
+  top_k: 10
 backtest:
   commission_bps: 1.0
   half_spread_bps: 5.0
-  slippage_bps: 2.0
-  volatility_slippage_multiplier: 0.08
-  participation_slippage_bps: 75.0
-  market_impact_multiplier: 0.15
-  borrow_bps_per_year: 300.0
-  max_position_weight: 0.05
+  slippage_bps: 3.0
+  volatility_slippage_multiplier: 0.10
+  participation_slippage_bps: 100.0
+  market_impact_multiplier: 0.20
+  borrow_bps_per_year: 0.0
+  max_position_weight: 0.10
   max_gross_exposure: 1.0
-  max_net_exposure: 0.2
-  max_sector_weight: 0.25
-  max_beta_exposure: 0.15
+  max_net_exposure: 1.0
+  max_sector_weight: 0.30
+  max_beta_exposure: 1.0
   missing_beta_fallback: 1.0
   missing_volatility_floor: 0.03
   max_daily_turnover: 0.25
   same_day_exit_notional_buffer: 0.10
-  max_participation_rate: 0.02
-  min_price: 5.0
-  min_dollar_volume: 5000000.0
+  max_participation_rate: 0.01
+  min_price: 100.0
+  min_dollar_volume: 100000000.0
   shorting_allowed: false
   hard_to_borrow_allowed: false
-  initial_capital: 1000000.0
+  initial_capital: 10000000.0
   rebalance_frequency: 1d
   benchmark: equal_weight
 runtime:
@@ -68,7 +71,7 @@ transformer:
   enabled: false
   model_name: null
   model_version: local-transformer-v1
-  batch_size: 32
+  batch_size: 16
   max_sequence_length: 256
   local_files_only: true
 llm_annotations:

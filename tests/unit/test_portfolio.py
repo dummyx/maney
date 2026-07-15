@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from nlp_trader.portfolio.constraints import PortfolioConstraints
-from nlp_trader.portfolio.construction import constrain_target_weights
+from nlp_trader.portfolio.construction import constrain_target_weights, construct_portfolio
 from nlp_trader.portfolio.risk import calculate_exposures
 
 
@@ -138,3 +138,41 @@ def test_participation_clipping_cannot_break_beta_constraint() -> None:
     assert abs(exposure.beta) <= constraints.max_beta_exposure + 1e-12
     assert not decision.risk_flags
     assert max(decision.participation.values()) <= constraints.max_participation_rate + 1e-12
+
+
+def test_construct_portfolio_applies_top_k_after_direction_eligibility() -> None:
+    rows = [
+        {
+            "asset_id": asset_id,
+            "symbol": asset_id.upper(),
+            "sector": "Mixed",
+            "beta": 0.0,
+            "close": 10.0,
+            "dollar_volume": 1_000_000.0,
+            "score": score,
+            "short_available": True,
+        }
+        for asset_id, score in (("a", 0.3), ("b", 0.2), ("c", -0.9))
+    ]
+
+    long_only = construct_portfolio(rows, {}, _constraints(), equity=1_000.0, top_k=1)
+    assert set(long_only.target_weights) == {"a"}
+
+    long_short = construct_portfolio(
+        rows,
+        {},
+        _constraints(shorting=True),
+        equity=1_000.0,
+        top_k=1,
+    )
+    assert set(long_short.target_weights) == {"c"}
+    assert long_short.target_weights["c"] < 0.0
+
+
+def test_construct_portfolio_rejects_non_positive_top_k() -> None:
+    try:
+        construct_portfolio([], {}, _constraints(), equity=1_000.0, top_k=0)
+    except ValueError as exc:
+        assert "top_k" in str(exc)
+    else:
+        raise AssertionError("top_k=0 should fail")
