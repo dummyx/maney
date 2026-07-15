@@ -20,15 +20,22 @@ class GoldEntityAnnotation:
     asset_id: str
     stance_label: GoldStanceLabel
     primary_event_type: EventType | None
-    evidence_span_ids: frozenset[str]
+    supporting_evidence_span_ids: frozenset[str]
+    counterevidence_span_ids: frozenset[str] = frozenset()
+    horizon_days: int = 1
 
     def __post_init__(self) -> None:
         if not self.item_id.strip() or not self.asset_id.strip():
             raise ValueError("gold item_id and asset_id must not be empty")
         if self.stance_label not in {"positive", "negative", "neutral"}:
             raise ValueError("gold stance_label must be positive, negative, or neutral")
-        if any(not value.strip() for value in self.evidence_span_ids):
+        evidence_ids = self.supporting_evidence_span_ids | self.counterevidence_span_ids
+        if any(not value.strip() for value in evidence_ids):
             raise ValueError("gold evidence span IDs must not be empty")
+        if self.supporting_evidence_span_ids & self.counterevidence_span_ids:
+            raise ValueError("gold supporting and counterevidence must be disjoint")
+        if not 1 <= self.horizon_days <= 252:
+            raise ValueError("gold horizon_days must be between 1 and 252")
 
 
 def _macro_f1(expected: list[str], predicted: list[str]) -> float:
@@ -105,6 +112,9 @@ def evaluate_annotation_set(
     confidences: list[float] = []
     cited = 0
     correct_citations = 0
+    counterevidence_cited = 0
+    correct_counterevidence = 0
+    correct_horizons = 0
     abstentions = 0
     for key, expected in sorted(gold_by_key.items()):
         predicted = predicted_by_key.get(key)
@@ -124,10 +134,17 @@ def evaluate_annotation_set(
         )
         is_correct = predicted.stance_label == expected.stance_label
         correctness.append(float(is_correct))
-        confidences.append(predicted.stance_confidence)
+        confidences.append(predicted.raw_confidence)
         abstentions += predicted.stance_label == "abstain"
-        cited += len(predicted.evidence_span_ids)
-        correct_citations += len(set(predicted.evidence_span_ids) & expected.evidence_span_ids)
+        cited += len(predicted.supporting_evidence_span_ids)
+        correct_citations += len(
+            set(predicted.supporting_evidence_span_ids) & expected.supporting_evidence_span_ids
+        )
+        counterevidence_cited += len(predicted.counterevidence_span_ids)
+        correct_counterevidence += len(
+            set(predicted.counterevidence_span_ids) & expected.counterevidence_span_ids
+        )
+        correct_horizons += predicted.horizon_days == expected.horizon_days
 
     example_count = len(gold)
     brier = (
@@ -166,17 +183,24 @@ def evaluate_annotation_set(
 
     item_count = len(gold_item_ids)
     return {
-        "artifact_schema_version": "llm-annotation-evaluation-v1",
+        "artifact_schema_version": "llm-semantic-signal-evaluation-v2",
         "item_count": item_count,
         "entity_count": example_count,
         "stance_macro_f1": _macro_f1(expected_stances, predicted_stances),
         "event_macro_f1": _macro_f1(expected_events, predicted_events),
         "evidence_precision": correct_citations / cited if cited else 0.0,
+        "supporting_evidence_precision": correct_citations / cited if cited else 0.0,
+        "counterevidence_precision": (
+            correct_counterevidence / counterevidence_cited if counterevidence_cited else 0.0
+        ),
+        "horizon_accuracy": correct_horizons / example_count if example_count else 0.0,
         "abstention_count": abstentions,
         "abstention_rate": abstentions / example_count if example_count else 0.0,
         "invalid_item_count": len(invalid_item_ids),
         "invalid_response_rate": len(invalid_item_ids) / item_count if item_count else 0.0,
         "stance_confidence_brier": brier,
         "stance_expected_calibration_error": calibration_error,
+        "raw_confidence_brier": brier,
+        "raw_confidence_expected_calibration_error": calibration_error,
         "calibration_bins": calibration_rows,
     }

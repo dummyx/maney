@@ -52,8 +52,9 @@ def _config(tmp_path: Path, *, batch_size: int = 2) -> LLMAnnotationConfig:
         model_id="test-causal-lm",
         model_revision="test-revision",
         model_license_or_terms_ref="redistributable-test-fixture",
-        prompt_version="entity-event-v1",
-        schema_version="entity-event-v1",
+        prompt_version="semantic-evidence-v2",
+        schema_version="semantic-signal-v2",
+        verifier_version="semantic-evidence-verifier-v1",
         cache_dir=tmp_path / "cache",
         batch_size=batch_size,
     )
@@ -65,21 +66,31 @@ def _valid_payload() -> dict[str, object]:
             {
                 "asset_id": "asset_a",
                 "stance_label": "positive",
-                "stance_confidence": 0.9,
+                "semantic_signal": 2,
+                "raw_confidence": 0.9,
                 "uncertainty": 0.1,
+                "horizon_days": 1,
                 "primary_event_type": "guidance",
                 "event_confidence": 0.8,
-                "evidence_span_ids": ["S2"],
+                "supporting_evidence_span_ids": ["S2"],
+                "counterevidence_span_ids": [],
+                "mechanism": "Raised guidance indicates a stronger operating outlook.",
+                "invalidation_conditions": ["The issuer reverses its guidance."],
                 "abstain_reason": None,
             },
             {
                 "asset_id": "asset_b",
                 "stance_label": "negative",
-                "stance_confidence": 0.7,
+                "semantic_signal": -1,
+                "raw_confidence": 0.7,
                 "uncertainty": 0.2,
+                "horizon_days": 1,
                 "primary_event_type": None,
                 "event_confidence": 0.0,
-                "evidence_span_ids": ["S1"],
+                "supporting_evidence_span_ids": ["S1"],
+                "counterevidence_span_ids": [],
+                "mechanism": "The supplied update is adverse for the issuer.",
+                "invalidation_conditions": ["The adverse update is withdrawn."],
                 "abstain_reason": None,
             },
         ]
@@ -98,6 +109,8 @@ def test_request_contains_only_current_source_evidence_and_canonical_candidates(
     assert item.available_at.isoformat() not in request.prompt
     assert "published_at" not in request.prompt
     assert "available_at" not in request.prompt
+    assert request.target_horizon_days == 1
+    assert request.source_available_at <= request.decision_time
 
 
 def test_entity_specific_response_is_strictly_parsed_cached_and_replayed(tmp_path: Path) -> None:
@@ -129,6 +142,28 @@ def test_entity_specific_response_is_strictly_parsed_cached_and_replayed(tmp_pat
         ("asset_b", "negative"),
     ]
     assert len(list(config.cache_dir.glob("*.json"))) == 1
+
+
+def test_cache_replay_binds_structured_payload_to_raw_generation(tmp_path: Path) -> None:
+    request = build_annotation_request(_item(), _candidates())
+    config = _config(tmp_path)
+    engine = CachedLocalLLMAnnotator(
+        config,
+        generator=lambda values: [
+            GenerationResponse(
+                request_id=values[0].request_id,
+                generated_text=json.dumps(_valid_payload()),
+            )
+        ],
+    )
+    engine.annotate([request])
+    cache_path = next(config.cache_dir.glob("*.json"))
+    record = json.loads(cache_path.read_text(encoding="utf-8"))
+    record["annotation_payload"]["annotations"][0]["raw_confidence"] = 0.1
+    cache_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match its raw generation"):
+        CachedLocalLLMAnnotator(config, generator=lambda _values: []).annotate([request])
 
 
 def test_identical_canonical_text_is_generated_once_across_item_ids(tmp_path: Path) -> None:
@@ -178,7 +213,7 @@ def test_identical_canonical_text_is_generated_once_across_item_ids(tmp_path: Pa
                 "annotations": [
                     {
                         **_valid_payload()["annotations"][0],  # type: ignore[index]
-                        "evidence_span_ids": ["S999"],
+                        "supporting_evidence_span_ids": ["S999"],
                     },
                     _valid_payload()["annotations"][1],  # type: ignore[index]
                 ]
@@ -191,7 +226,7 @@ def test_invalid_or_ungrounded_output_fails_without_writing_cache(
     generated_text: str,
 ) -> None:
     request = build_annotation_request(_item(), _candidates())
-    config = _config(tmp_path)
+    config = replace(_config(tmp_path), attempt_dir=tmp_path / "attempts")
     engine = CachedLocalLLMAnnotator(
         config,
         generator=lambda values: [
@@ -199,9 +234,13 @@ def test_invalid_or_ungrounded_output_fails_without_writing_cache(
         ],
     )
 
-    with pytest.raises(ValueError, match="strict annotation JSON|exactly match|unknown evidence"):
+    with pytest.raises(ValueError, match="strict annotation JSON|annotation verification failed"):
         engine.annotate([request])
     assert not list(config.cache_dir.glob("*.json"))
+    attempt_paths = list((tmp_path / "attempts").glob("*.json"))
+    assert len(attempt_paths) == 1
+    attempt = json.loads(attempt_paths[0].read_text(encoding="utf-8"))
+    assert attempt["generation"]["generated_text"] == generated_text
 
 
 def test_one_invalid_response_prevents_all_new_batch_cache_writes(tmp_path: Path) -> None:
@@ -247,6 +286,198 @@ def test_input_too_long_becomes_explicit_per_candidate_abstention(tmp_path: Path
     assert cache_record["generation"]["input_too_long"] is True
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("semantic_signal", -1, "semantic_signal sign"),
+        (
+            "counterevidence_span_ids",
+            ["S2"],
+            "supporting and counterevidence",
+        ),
+        ("mechanism", "", "nonempty mechanism"),
+        ("invalidation_conditions", [], "invalidation conditions"),
+    ],
+)
+def test_v2_semantic_contract_rejects_inconsistent_claims(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    request = build_annotation_request(_item(), _candidates())
+    payload = _valid_payload()
+    annotations = payload["annotations"]
+    assert isinstance(annotations, list)
+    first = annotations[0]
+    assert isinstance(first, dict)
+    first[field] = value
+    engine = CachedLocalLLMAnnotator(
+        _config(tmp_path),
+        generator=lambda values: [
+            GenerationResponse(
+                request_id=values[0].request_id,
+                generated_text=json.dumps(payload),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="strict annotation JSON") as exc_info:
+        engine.annotate([request])
+    assert message in str(exc_info.value.__cause__)
+
+
+def test_verifier_rejects_horizon_mismatch_and_ungrounded_numeric_claims(
+    tmp_path: Path,
+) -> None:
+    request = build_annotation_request(_item(), _candidates(), target_horizon_days=5)
+    payload = _valid_payload()
+    annotations = payload["annotations"]
+    assert isinstance(annotations, list)
+    for annotation in annotations:
+        assert isinstance(annotation, dict)
+        annotation["horizon_days"] = 1
+    engine = CachedLocalLLMAnnotator(
+        _config(tmp_path),
+        generator=lambda values: [
+            GenerationResponse(
+                request_id=values[0].request_id,
+                generated_text=json.dumps(payload),
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="horizon_alignment"):
+        engine.annotate([request])
+
+    grounded_request = build_annotation_request(_item(), _candidates())
+    payload = _valid_payload()
+    annotations = payload["annotations"]
+    assert isinstance(annotations, list) and isinstance(annotations[0], dict)
+    annotations[0]["mechanism"] = "Revenue rises 99 percent."
+    numeric_root = tmp_path / "numeric"
+    numeric_root.mkdir()
+    engine = CachedLocalLLMAnnotator(
+        _config(numeric_root),
+        generator=lambda values: [
+            GenerationResponse(
+                request_id=values[0].request_id,
+                generated_text=json.dumps(payload),
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="numeric_claim_grounding"):
+        engine.annotate([grounded_request])
+
+
+def test_generation_usage_and_configured_token_cost_are_audited(tmp_path: Path) -> None:
+    request = build_annotation_request(_item(), _candidates())
+    config = replace(
+        _config(tmp_path),
+        input_cost_per_million_tokens_usd=2.0,
+        output_cost_per_million_tokens_usd=4.0,
+    )
+
+    def generator(values: list[GenerationRequest]) -> list[GenerationResponse]:
+        return [
+            GenerationResponse(
+                request_id=values[0].request_id,
+                generated_text=json.dumps(_valid_payload()),
+                input_token_count=1_000,
+                output_token_count=500,
+                generation_latency_seconds=0.25,
+            )
+        ]
+
+    engine = CachedLocalLLMAnnotator(config, generator=generator)
+    engine.annotate([request])
+
+    assert engine.generated_input_token_count == 1_000
+    assert engine.generated_output_token_count == 500
+    assert engine.generation_latency_seconds == pytest.approx(0.25)
+    assert engine.estimated_inference_cost_usd == pytest.approx(0.004)
+    assert engine.inference_source_for(request) == "generated"
+    assert engine.cache_record_for(request)["generation"]["estimated_cost_usd"] == pytest.approx(
+        0.004
+    )
+
+
+def test_unknown_generation_token_counts_make_totals_and_cost_indeterminate(
+    tmp_path: Path,
+) -> None:
+    request = build_annotation_request(_item(), _candidates())
+    config = replace(
+        _config(tmp_path),
+        input_cost_per_million_tokens_usd=2.0,
+        output_cost_per_million_tokens_usd=4.0,
+    )
+    engine = CachedLocalLLMAnnotator(
+        config,
+        generator=lambda values: [
+            GenerationResponse(
+                request_id=values[0].request_id,
+                generated_text=json.dumps(_valid_payload()),
+            )
+        ],
+    )
+
+    engine.annotate([request])
+
+    assert engine.generated_input_token_count is None
+    assert engine.generated_output_token_count is None
+    assert engine.estimated_inference_cost_usd is None
+
+
+def test_batch_rounds_record_full_latency_while_summary_counts_wall_time_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = [
+        build_annotation_request(
+            _item(item_id=f"item-{index}", body=f"Issuer A raised guidance case {index}."),
+            _candidates(),
+        )
+        for index in range(2)
+    ]
+    ticks = iter((10.0, 12.0))
+    monkeypatch.setattr(llm_module.time, "perf_counter", lambda: next(ticks))
+    engine = CachedLocalLLMAnnotator(
+        _config(tmp_path, batch_size=2),
+        generator=lambda values: [
+            GenerationResponse(
+                request_id=value.request_id,
+                generated_text=json.dumps(_valid_payload()),
+            )
+            for value in values
+        ],
+    )
+
+    engine.annotate(requests)
+
+    assert engine.generation_latency_seconds == pytest.approx(2.0)
+    assert [
+        engine.cache_record_for(request)["generation"]["generation_latency_seconds"]
+        for request in requests
+    ] == pytest.approx([2.0, 2.0])
+
+
+def test_effective_generated_tokens_exclude_batch_padding() -> None:
+    assert llm_module._effective_generated_tokens(
+        [8, 2, 0, 0],
+        eos_ids={2},
+        pad_token_id=0,
+    ) == ([8, 2], True)
+    assert llm_module._effective_generated_tokens(
+        [8, 9, 10],
+        eos_ids={2},
+        pad_token_id=0,
+    ) == ([8, 9, 10], False)
+    assert llm_module._effective_generated_tokens(
+        [8, 0, 0],
+        eos_ids={2},
+        pad_token_id=0,
+    ) == ([8], True)
+
+
 def test_cache_identity_changes_with_exact_model_bytes_and_schema(tmp_path: Path) -> None:
     request = build_annotation_request(_item(), _candidates())
     config = _config(tmp_path)
@@ -257,7 +488,7 @@ def test_cache_identity_changes_with_exact_model_bytes_and_schema(tmp_path: Path
     changed_model = CachedLocalLLMAnnotator(config, generator=lambda _values: [])
     assert changed_model.cache_key_for(request) != first_key
 
-    changed_schema_config = replace(config, schema_version="entity-event-v2")
+    changed_schema_config = replace(config, schema_version="semantic-signal-v3")
     changed_schema = CachedLocalLLMAnnotator(
         changed_schema_config,
         generator=lambda _values: [],

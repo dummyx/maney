@@ -18,17 +18,26 @@ def _enabled_llm_config(
     generated_config: ResearchConfig,
     model_path: Path,
     *,
-    apply_to_features: bool = False,
+    feature_mode: str = "sidecar",
 ) -> ResearchConfig:
     payload = generated_config.model_dump(mode="python")
     payload["paths"]["llm_model"] = model_path
     payload["llm_annotations"] = {
         "enabled": True,
-        "apply_to_features": apply_to_features,
+        "feature_mode": feature_mode,
         "model_id": "local-test-causal-lm",
         "model_revision": "immutable-test-revision",
         "model_license_or_terms_ref": "redistributable-test-fixture",
     }
+    if feature_mode == "augment":
+        payload["models"]["families"] = [
+            "traditional",
+            "text",
+            "combined",
+            "llm",
+            "traditional_llm",
+            "all",
+        ]
     return ResearchConfig.model_validate(payload)
 
 
@@ -59,7 +68,7 @@ def test_enabled_llm_model_directory_is_validated_and_hashed(
 
 def test_llm_application_requires_enabled_local_identity_and_safe_loading() -> None:
     with pytest.raises(ValidationError, match="enabled must be true"):
-        LLMAnnotationsConfig(apply_to_features=True)
+        LLMAnnotationsConfig(feature_mode="augment")
 
     with pytest.raises(ValidationError, match="model_revision"):
         LLMAnnotationsConfig(
@@ -75,7 +84,7 @@ def test_llm_application_requires_enabled_local_identity_and_safe_loading() -> N
         LLMAnnotationsConfig.model_validate({"trust_remote_code": True})
 
 
-def test_applied_llm_and_transformer_sentiment_cannot_compete(
+def test_llm_augmentation_requires_ablation_families_and_can_coexist_with_transformer(
     generated_config: ResearchConfig,
     tmp_path: Path,
 ) -> None:
@@ -85,7 +94,7 @@ def test_applied_llm_and_transformer_sentiment_cannot_compete(
     configured = _enabled_llm_config(
         generated_config,
         model_path,
-        apply_to_features=True,
+        feature_mode="augment",
     )
     payload = configured.model_dump(mode="python")
     payload["transformer"] = TransformerConfig(
@@ -93,5 +102,15 @@ def test_applied_llm_and_transformer_sentiment_cannot_compete(
         model_name="local-transformer",
     )
 
-    with pytest.raises(ValidationError, match="cannot both be enabled"):
+    validated = ResearchConfig.model_validate(payload)
+    assert validated.transformer.enabled is True
+    assert validated.llm_annotations.feature_mode == "augment"
+
+    payload["models"]["families"] = ["traditional", "text", "combined"]
+    with pytest.raises(ValidationError, match="canonical LLM ablation"):
         ResearchConfig.model_validate(payload)
+
+
+def test_llm_cost_rates_must_be_configured_as_a_pair() -> None:
+    with pytest.raises(ValidationError, match="configured together"):
+        LLMAnnotationsConfig(input_cost_per_million_tokens_usd=1.0)

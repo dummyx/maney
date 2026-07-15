@@ -23,9 +23,9 @@ features:
   text_warmup_days: 40
   event_lookahead_days: 30
   horizon_days: 1
-  feature_set_version: backtest-v3
+  feature_set_version: backtest-v4
   label_version: backtest-v2
-  model_version: backtest-walk-forward-v3
+  model_version: backtest-walk-forward-v4
   text_decay_half_life_days: 1.0
   decision_time: close
 models:
@@ -73,17 +73,20 @@ transformer:
   local_files_only: true
 llm_annotations:
   enabled: false
-  apply_to_features: false
+  feature_mode: sidecar
   backend: transformers_causal_lm
   model_id: null
   model_revision: null
   model_license_or_terms_ref: null
-  prompt_version: entity-event-v1
-  schema_version: entity-event-v1
+  prompt_version: semantic-evidence-v2
+  schema_version: semantic-signal-v2
+  verifier_version: semantic-evidence-verifier-v1
   batch_size: 1
   max_input_tokens: 2048
   max_new_tokens: 384
   decoding: greedy
   seed: 7
+  input_cost_per_million_tokens_usd: null
+  output_cost_per_million_tokens_usd: null
   local_files_only: true
   trust_remote_code: false

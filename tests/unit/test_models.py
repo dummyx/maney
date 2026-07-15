@@ -253,6 +253,9 @@ def test_model_discovery_includes_engineered_values_but_not_availability_provena
             "author_disagreement_1d": 0.2,
             "latest_text_age_hours_1d": 2.0,
             "latest_text_available_at_1d": "2026-07-01T18:00:00Z",
+            "llm_semantic_mean_1d": 1.0,
+            "llm_raw_confidence_mean_1d": 0.8,
+            "llm_missing_1d": False,
         }
     ]
     labels = [
@@ -268,6 +271,7 @@ def test_model_discovery_includes_engineered_values_but_not_availability_provena
     model = train_baselines(features, labels, model_version="test-v1")
     traditional = set(model["families"]["traditional"]["features"])
     text = set(model["families"]["text"]["features"])
+    combined = set(model["families"]["combined"]["features"])
 
     assert {
         "short_term_reversal_1d",
@@ -286,3 +290,76 @@ def test_model_discovery_includes_engineered_values_but_not_availability_provena
     assert "fundamental_available_at" not in traditional
     assert "earnings_calendar_available_at" not in traditional
     assert "latest_text_available_at_1d" not in text
+    assert not {"llm_semantic_mean_1d", "llm_raw_confidence_mean_1d", "llm_missing_1d"} & (
+        traditional | text | combined
+    )
+
+
+def test_llm_model_families_are_explicit_and_do_not_change_default_semantics() -> None:
+    features, labels = _rows()
+    enriched_features = [
+        {
+            **row,
+            "llm_semantic_mean_1d": 1.0 if row["symbol"] == "AAA" else -1.0,
+            "llm_semantic_conf_weighted_1d": 0.8 if row["symbol"] == "AAA" else -0.8,
+            "llm_raw_confidence_mean_1d": 0.8,
+            "llm_missing_1d": False,
+        }
+        for row in features
+    ]
+
+    default_model = train_baselines(enriched_features, labels, model_version="default-v1")
+    assert set(default_model["families"]) == {"traditional", "text", "combined"}
+    assert all(
+        not any(column.startswith("llm_") for column in spec["features"])
+        for spec in default_model["families"].values()
+    )
+
+    llm_model = train_baselines(
+        enriched_features,
+        labels,
+        model_version="llm-v1",
+        families=("llm", "traditional_llm", "all"),
+    )
+    assert list(llm_model["families"]) == ["llm", "traditional_llm", "all"]
+    llm_columns = set(llm_model["families"]["llm"]["features"])
+    traditional_llm_columns = set(llm_model["families"]["traditional_llm"]["features"])
+    all_columns = set(llm_model["families"]["all"]["features"])
+    assert llm_columns == {
+        "llm_missing_1d",
+        "llm_raw_confidence_mean_1d",
+        "llm_semantic_mean_1d",
+    }
+    assert traditional_llm_columns > llm_columns
+    assert all_columns > traditional_llm_columns
+    assert "return_1d" in traditional_llm_columns
+    assert "sentiment_mean_1d" not in traditional_llm_columns
+    assert "sentiment_mean_1d" in all_columns
+
+    predictions = predict_all_families(enriched_features, llm_model)
+    assert set(predictions) == {
+        "llm",
+        "traditional_llm",
+        "all",
+        "equal_weight",
+        "momentum_only",
+        "no_trade",
+    }
+
+
+@pytest.mark.parametrize(
+    ("families", "message"),
+    [
+        ((), "must not be empty"),
+        (("llm", "llm"), "must be unique"),
+        (("unknown",), "unknown model families"),
+    ],
+)
+def test_training_rejects_invalid_model_family_selection(
+    families: tuple[str, ...],
+    message: str,
+) -> None:
+    features, labels = _rows()
+
+    with pytest.raises(ValueError, match=message):
+        train_baselines(features, labels, model_version="test-v1", families=families)

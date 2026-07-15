@@ -248,6 +248,14 @@ class TextSignal:
     event_type: str | None = None
     spam_score: float | None = None
     disagreement: float | None = None
+    llm_semantic_signal: int | None = None
+    llm_raw_confidence: float | None = None
+    llm_uncertainty: float | None = None
+    llm_event_type: str | None = None
+    llm_event_confidence: float | None = None
+    llm_supporting_evidence_count: int | None = None
+    llm_counterevidence_count: int | None = None
+    llm_abstained: bool | None = None
 
     def __post_init__(self) -> None:
         for name in ("item_id", "asset_id", "symbol", "model_version"):
@@ -264,6 +272,22 @@ class TextSignal:
             value = getattr(self, name)
             if value is not None:
                 _range(value, name)
+        if self.llm_semantic_signal is not None and (
+            type(self.llm_semantic_signal) is not int or not -2 <= self.llm_semantic_signal <= 2
+        ):
+            raise ValueError("llm_semantic_signal must be an integer between -2 and 2")
+        for name in ("llm_raw_confidence", "llm_uncertainty", "llm_event_confidence"):
+            value = getattr(self, name)
+            if value is not None:
+                _range(value, name)
+        if self.llm_event_type is not None:
+            _nonempty(self.llm_event_type, "llm_event_type")
+        for name in ("llm_supporting_evidence_count", "llm_counterevidence_count"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a non-negative integer when supplied")
+        if self.llm_abstained is not None and type(self.llm_abstained) is not bool:
+            raise ValueError("llm_abstained must be a boolean when supplied")
 
 
 @dataclass(frozen=True, slots=True)

@@ -528,6 +528,23 @@ def _empty_text_features(
     row[f"event_source_interaction_{prefix}"] = 0.0
     row[f"event_source_interaction_missing_{prefix}"] = True
     row[f"text_decay_half_life_days_{prefix}"] = decay_half_life_days
+    row[f"llm_annotation_count_{prefix}"] = 0
+    row[f"llm_non_abstention_count_{prefix}"] = 0
+    row[f"llm_annotation_coverage_{prefix}"] = 0.0
+    row[f"llm_abstention_rate_{prefix}"] = 0.0
+    row[f"llm_semantic_mean_{prefix}"] = 0.0
+    row[f"llm_raw_confidence_mean_{prefix}"] = 0.0
+    row[f"llm_uncertainty_mean_{prefix}"] = 0.0
+    row[f"llm_event_confidence_mean_{prefix}"] = 0.0
+    row[f"llm_supporting_evidence_count_{prefix}"] = 0
+    row[f"llm_counterevidence_count_{prefix}"] = 0
+    row[f"llm_evidence_agreement_{prefix}"] = 0.0
+    row[f"llm_missing_{prefix}"] = True
+    row[f"llm_semantic_missing_{prefix}"] = True
+    row[f"llm_raw_confidence_missing_{prefix}"] = True
+    row[f"llm_uncertainty_missing_{prefix}"] = True
+    row[f"llm_event_confidence_missing_{prefix}"] = True
+    row[f"llm_evidence_missing_{prefix}"] = True
     for name in zero_features:
         row[f"{name}_{prefix}"] = 0.0
     for event_type in event_types:
@@ -592,6 +609,73 @@ def _populate_independent_text_diagnostics(
     )
     row[f"mention_velocity_{prefix}"] = row[f"attention_mention_velocity_{prefix}"]
     row[f"abnormal_mention_volume_{prefix}"] = row[f"attention_abnormal_{prefix}"]
+
+
+def _populate_llm_text_features(
+    row: dict[str, Any],
+    window: list[TextSignal],
+    prefix: str,
+) -> None:
+    """Aggregate only independent, point-in-time-admissible LLM annotations."""
+
+    annotated = [signal for signal in window if signal.llm_abstained is not None]
+    non_abstained = [signal for signal in annotated if signal.llm_abstained is False]
+    semantic_values = [
+        float(signal.llm_semantic_signal)
+        for signal in non_abstained
+        if signal.llm_semantic_signal is not None
+    ]
+    raw_confidences = [
+        float(signal.llm_raw_confidence)
+        for signal in non_abstained
+        if signal.llm_raw_confidence is not None
+    ]
+    uncertainties = [
+        float(signal.llm_uncertainty) for signal in annotated if signal.llm_uncertainty is not None
+    ]
+    event_confidences = [
+        float(signal.llm_event_confidence)
+        for signal in non_abstained
+        if signal.llm_event_confidence is not None
+    ]
+    supporting_evidence_count = sum(
+        signal.llm_supporting_evidence_count or 0 for signal in annotated
+    )
+    counterevidence_count = sum(signal.llm_counterevidence_count or 0 for signal in annotated)
+    evidence_count = supporting_evidence_count + counterevidence_count
+
+    annotation_count = len(annotated)
+    row[f"llm_annotation_count_{prefix}"] = annotation_count
+    row[f"llm_non_abstention_count_{prefix}"] = len(non_abstained)
+    row[f"llm_annotation_coverage_{prefix}"] = annotation_count / len(window)
+    row[f"llm_abstention_rate_{prefix}"] = (
+        sum(signal.llm_abstained is True for signal in annotated) / annotation_count
+        if annotation_count
+        else 0.0
+    )
+    row[f"llm_semantic_mean_{prefix}"] = (
+        statistics.fmean(semantic_values) if semantic_values else 0.0
+    )
+    row[f"llm_raw_confidence_mean_{prefix}"] = (
+        statistics.fmean(raw_confidences) if raw_confidences else 0.0
+    )
+    row[f"llm_uncertainty_mean_{prefix}"] = (
+        statistics.fmean(uncertainties) if uncertainties else 0.0
+    )
+    row[f"llm_event_confidence_mean_{prefix}"] = (
+        statistics.fmean(event_confidences) if event_confidences else 0.0
+    )
+    row[f"llm_supporting_evidence_count_{prefix}"] = supporting_evidence_count
+    row[f"llm_counterevidence_count_{prefix}"] = counterevidence_count
+    row[f"llm_evidence_agreement_{prefix}"] = (
+        supporting_evidence_count / evidence_count if evidence_count else 0.0
+    )
+    row[f"llm_missing_{prefix}"] = not annotated
+    row[f"llm_semantic_missing_{prefix}"] = not semantic_values
+    row[f"llm_raw_confidence_missing_{prefix}"] = not raw_confidences
+    row[f"llm_uncertainty_missing_{prefix}"] = not uncertainties
+    row[f"llm_event_confidence_missing_{prefix}"] = not event_confidences
+    row[f"llm_evidence_missing_{prefix}"] = evidence_count == 0
 
 
 def _populate_text_features(
@@ -677,6 +761,7 @@ def _populate_text_features(
 
     _populate_raw_text_diagnostics(row, raw_window, days, prefix, raw_prior_count)
     _populate_independent_text_diagnostics(row, window, asof_ts, days, prefix, prior_count)
+    _populate_llm_text_features(row, window, prefix)
     sources = {signal.source for signal in window if signal.source}
     authors = {signal.author_hash for signal in window if signal.author_hash}
     author_groups: dict[str, list[float]] = defaultdict(list)

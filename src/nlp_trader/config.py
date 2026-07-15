@@ -64,7 +64,9 @@ class FeatureConfig(FrozenModel):
 
 
 class ModelConfig(FrozenModel):
-    families: tuple[Literal["traditional", "text", "combined"], ...] = (
+    families: tuple[
+        Literal["traditional", "text", "combined", "llm", "traditional_llm", "all"], ...
+    ] = (
         "traditional",
         "text",
         "combined",
@@ -76,9 +78,12 @@ class ModelConfig(FrozenModel):
 
     @model_validator(mode="after")
     def validate_families(self) -> ModelConfig:
-        if self.families != ("traditional", "text", "combined"):
+        baseline = ("traditional", "text", "combined")
+        llm_ablation = (*baseline, "llm", "traditional_llm", "all")
+        if self.families not in {baseline, llm_ablation}:
             raise ValueError(
-                "models.families must be [traditional, text, combined] for this baseline"
+                "models.families must be either [traditional, text, combined] or the canonical "
+                "LLM ablation set [traditional, text, combined, llm, traditional_llm, all]"
             )
         return self
 
@@ -197,25 +202,32 @@ class LLMAnnotationsConfig(FrozenModel):
     """Optional, local-only generative annotation settings."""
 
     enabled: bool = False
-    apply_to_features: bool = False
+    feature_mode: Literal["sidecar", "augment"] = "sidecar"
     backend: Literal["transformers_causal_lm"] = "transformers_causal_lm"
     model_id: str | None = None
     model_revision: str | None = None
     model_license_or_terms_ref: str | None = None
-    prompt_version: str = Field(default="entity-event-v1", min_length=1)
-    schema_version: str = Field(default="entity-event-v1", min_length=1)
+    prompt_version: str = Field(default="semantic-evidence-v2", min_length=1)
+    schema_version: str = Field(default="semantic-signal-v2", min_length=1)
+    verifier_version: str = Field(default="semantic-evidence-verifier-v1", min_length=1)
     batch_size: int = Field(default=1, ge=1)
     max_input_tokens: int = Field(default=2048, ge=1)
     max_new_tokens: int = Field(default=384, ge=1)
     decoding: Literal["greedy"] = "greedy"
     seed: int = Field(default=7, ge=0)
+    input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0.0)
+    output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0.0)
     local_files_only: Literal[True] = True
     trust_remote_code: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_enabled_settings(self) -> LLMAnnotationsConfig:
-        if self.apply_to_features and not self.enabled:
-            raise ValueError("llm_annotations.enabled must be true when apply_to_features is true")
+        if self.feature_mode == "augment" and not self.enabled:
+            raise ValueError("llm_annotations.enabled must be true in augment feature_mode")
+        if (self.input_cost_per_million_tokens_usd is None) != (
+            self.output_cost_per_million_tokens_usd is None
+        ):
+            raise ValueError("LLM input and output token cost rates must be configured together")
         if self.enabled:
             required = {
                 "model_id": self.model_id,
@@ -254,11 +266,18 @@ class ResearchConfig(FrozenModel):
             )
         if self.llm_annotations.enabled and self.paths.llm_model is None:
             raise ValueError("paths.llm_model is required when llm_annotations.enabled is true")
-        if self.transformer.enabled and self.llm_annotations.apply_to_features:
+        baseline_families = ("traditional", "text", "combined")
+        llm_families = (*baseline_families, "llm", "traditional_llm", "all")
+        if self.llm_annotations.feature_mode == "augment" and self.models.families != llm_families:
             raise ValueError(
-                "transformer sentiment and LLM annotation feature application cannot both be "
-                "enabled; LLM sidecar-only annotation may coexist with transformer sentiment"
+                "llm_annotations.feature_mode=augment requires the canonical LLM ablation "
+                "models.families set"
             )
+        if (
+            self.llm_annotations.feature_mode == "sidecar"
+            and self.models.families != baseline_families
+        ):
+            raise ValueError("LLM ablation model families require feature_mode=augment")
         return self
 
     def content_hash(self) -> str:

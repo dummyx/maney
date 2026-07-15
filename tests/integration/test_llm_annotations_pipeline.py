@@ -8,7 +8,8 @@ from typing import Any
 from nlp_trader.config import ResearchConfig
 from nlp_trader.data.parquet import read_partitioned_parquet
 from nlp_trader.nlp.llm_annotations import GenerationRequest, GenerationResponse
-from nlp_trader.pipeline import build_features
+from nlp_trader.nlp.llm_decision_rounds import replay_decision_rounds_jsonl
+from nlp_trader.pipeline import backtest, build_features
 from nlp_trader.timestamps import parse_utc
 
 
@@ -16,7 +17,7 @@ def _enabled_llm_config(
     config: ResearchConfig,
     tmp_path: Path,
     *,
-    apply_to_features: bool,
+    feature_mode: str,
 ) -> ResearchConfig:
     model_dir = tmp_path / "local-llm"
     model_dir.mkdir(exist_ok=True)
@@ -25,7 +26,7 @@ def _enabled_llm_config(
     annotations = config.llm_annotations.model_copy(
         update={
             "enabled": True,
-            "apply_to_features": apply_to_features,
+            "feature_mode": feature_mode,
             "model_id": "local-test-llm",
             "model_revision": "test-revision-1",
             "model_license_or_terms_ref": "synthetic-test-only",
@@ -34,7 +35,23 @@ def _enabled_llm_config(
             "max_new_tokens": 256,
         }
     )
-    return config.model_copy(update={"paths": paths, "llm_annotations": annotations})
+    models = config.models
+    if feature_mode == "augment":
+        models = models.model_copy(
+            update={
+                "families": (
+                    "traditional",
+                    "text",
+                    "combined",
+                    "llm",
+                    "traditional_llm",
+                    "all",
+                )
+            }
+        )
+    return config.model_copy(
+        update={"paths": paths, "llm_annotations": annotations, "models": models}
+    )
 
 
 def _input_payload(request: GenerationRequest) -> dict[str, Any]:
@@ -59,11 +76,16 @@ def _positive_annotation(asset_id: str) -> dict[str, object]:
     return {
         "asset_id": asset_id,
         "stance_label": "positive",
-        "stance_confidence": 0.8,
+        "semantic_signal": 2,
+        "raw_confidence": 0.8,
         "uncertainty": 0.1,
+        "horizon_days": 1,
         "primary_event_type": None,
         "event_confidence": 0.0,
-        "evidence_span_ids": ["S1"],
+        "supporting_evidence_span_ids": ["S1"],
+        "counterevidence_span_ids": [],
+        "mechanism": "The operating update supports a positive semantic assessment.",
+        "invalidation_conditions": ["The operating update is withdrawn."],
         "abstain_reason": None,
     }
 
@@ -111,7 +133,7 @@ def test_sidecar_annotations_are_audited_without_changing_signals_and_replay_fro
     configured = _enabled_llm_config(
         generated_config,
         tmp_path,
-        apply_to_features=False,
+        feature_mode="sidecar",
     )
     calls: list[list[str]] = []
 
@@ -139,8 +161,11 @@ def test_sidecar_annotations_are_audited_without_changing_signals_and_replay_fro
         "llm_annotation_schema",
         "llm_annotation_provenance",
         "llm_annotation_responses",
+        "llm_annotation_generation_attempts",
         "llm_annotations",
         "llm_annotation_summary",
+        "llm_verification_summary",
+        "llm_decision_rounds",
     ):
         assert key in sidecar_outputs
     provenance = json.loads(
@@ -151,12 +176,20 @@ def test_sidecar_annotations_are_audited_without_changing_signals_and_replay_fro
     )
     annotation_rows = _partition_rows(sidecar_outputs, "llm_annotations")
     assert provenance["retrospective_parser"] is True
-    assert provenance["apply_to_features"] is False
+    assert provenance["feature_mode"] == "sidecar"
     assert len(provenance["model_directory_sha256"]) == 64
     assert summary["request_count"] == 3
     assert summary["annotation_count"] == 3
-    assert summary["apply_to_features"] is False
+    assert summary["feature_mode"] == "sidecar"
+    assert summary["generated_input_token_count"] is None
+    assert summary["generated_output_token_count"] is None
+    assert summary["estimated_inference_cost_usd"] is None
     assert len(annotation_rows) == 3
+    rounds = replay_decision_rounds_jsonl(Path(str(sidecar_outputs["llm_decision_rounds"])))
+    assert len(rounds) == 3
+    assert {round.inference_source for round in rounds} == {"generated"}
+    assert all(round.source_available_at <= round.decision_time for round in rounds)
+    assert all(round.verifier.passed for round in rounds)
     cache_files = sorted(
         (configured.paths.models_dir / "_cache" / "llm_annotations").glob("*.json")
     )
@@ -169,9 +202,11 @@ def test_sidecar_annotations_are_audited_without_changing_signals_and_replay_fro
 
     assert _sorted_signals(replay_outputs) == _sorted_signals(baseline_outputs)
     assert len(replay_outputs["llm_annotation_responses"]) == 3
+    replay_rounds = replay_decision_rounds_jsonl(Path(str(replay_outputs["llm_decision_rounds"])))
+    assert {round.inference_source for round in replay_rounds} == {"cache"}
 
 
-def test_apply_mode_is_per_entity_and_abstention_preserves_deterministic_signal(
+def test_augment_mode_keeps_conventional_text_and_adds_per_entity_llm_features(
     generated_config: ResearchConfig,
     tmp_path: Path,
 ) -> None:
@@ -219,7 +254,7 @@ def test_apply_mode_is_per_entity_and_abstention_preserves_deterministic_signal(
     configured = _enabled_llm_config(
         baseline_config,
         tmp_path,
-        apply_to_features=True,
+        feature_mode="augment",
     )
 
     def fake_generator(requests: list[GenerationRequest]) -> list[GenerationResponse]:
@@ -238,31 +273,46 @@ def test_apply_mode_is_per_entity_and_abstention_preserves_deterministic_signal(
                     {
                         "asset_id": "asset_aaa",
                         "stance_label": "positive",
-                        "stance_confidence": 0.91,
+                        "semantic_signal": 2,
+                        "raw_confidence": 0.91,
                         "uncertainty": 0.05,
+                        "horizon_days": 1,
                         "primary_event_type": "guidance",
                         "event_confidence": 0.8,
-                        "evidence_span_ids": ["S2"],
+                        "supporting_evidence_span_ids": ["S2"],
+                        "counterevidence_span_ids": [],
+                        "mechanism": "Beating targets supports a positive near-term assessment.",
+                        "invalidation_conditions": ["The reported target beat is withdrawn."],
                         "abstain_reason": None,
                     },
                     {
                         "asset_id": "asset_bbb",
                         "stance_label": "negative",
-                        "stance_confidence": 0.82,
+                        "semantic_signal": -2,
+                        "raw_confidence": 0.82,
                         "uncertainty": 0.1,
+                        "horizon_days": 1,
                         "primary_event_type": "guidance",
                         "event_confidence": 0.9,
-                        "evidence_span_ids": ["S3"],
+                        "supporting_evidence_span_ids": ["S3"],
+                        "counterevidence_span_ids": [],
+                        "mechanism": "Cut guidance supports a negative near-term assessment.",
+                        "invalidation_conditions": ["The guidance cut is reversed."],
                         "abstain_reason": None,
                     },
                     {
                         "asset_id": "asset_ccc",
                         "stance_label": "abstain",
-                        "stance_confidence": 0.0,
+                        "semantic_signal": 0,
+                        "raw_confidence": 0.0,
                         "uncertainty": 1.0,
+                        "horizon_days": 1,
                         "primary_event_type": None,
                         "event_confidence": 0.0,
-                        "evidence_span_ids": [],
+                        "supporting_evidence_span_ids": [],
+                        "counterevidence_span_ids": [],
+                        "mechanism": None,
+                        "invalidation_conditions": [],
                         "abstain_reason": "insufficient entity-specific evidence",
                     },
                 ],
@@ -273,20 +323,33 @@ def test_apply_mode_is_per_entity_and_abstention_preserves_deterministic_signal(
     baseline = {row["asset_id"]: row for row in _sorted_signals(baseline_outputs)}
     applied = {row["asset_id"]: row for row in _sorted_signals(applied_outputs)}
 
-    assert applied["asset_aaa"]["sentiment_label"] == "positive"
-    assert applied["asset_aaa"]["sentiment_score"] == 0.91
-    assert applied["asset_bbb"]["sentiment_label"] == "negative"
-    assert applied["asset_bbb"]["sentiment_score"] == -0.82
-    assert str(applied["asset_aaa"]["model_version"]).startswith("llm:local-test-llm@")
-    assert str(applied["asset_bbb"]["model_version"]).startswith("llm:local-test-llm@")
-    for field in (
+    conventional_fields = (
         "sentiment_score",
         "sentiment_label",
         "sentiment_confidence",
         "event_type",
         "model_version",
-    ):
-        assert applied["asset_ccc"][field] == baseline["asset_ccc"][field]
+    )
+    for asset_id in ("asset_aaa", "asset_bbb", "asset_ccc"):
+        for field in conventional_fields:
+            assert applied[asset_id][field] == baseline[asset_id][field]
+
+    assert applied["asset_aaa"]["llm_semantic_signal"] == 2
+    assert applied["asset_aaa"]["llm_raw_confidence"] == 0.91
+    assert applied["asset_aaa"]["llm_uncertainty"] == 0.05
+    assert applied["asset_aaa"]["llm_abstained"] is False
+    assert applied["asset_bbb"]["llm_semantic_signal"] == -2
+    assert applied["asset_bbb"]["llm_raw_confidence"] == 0.82
+    assert applied["asset_ccc"]["llm_semantic_signal"] == 0
+    assert applied["asset_ccc"]["llm_raw_confidence"] == 0.0
+    assert applied["asset_ccc"]["llm_uncertainty"] == 1.0
+    assert applied["asset_ccc"]["llm_abstained"] is True
+
+    feature_rows = read_partitioned_parquet(Path(str(applied_outputs["features"])))
+    assert feature_rows
+    assert all("llm_semantic_mean_1d" in row for row in feature_rows)
+    assert all("llm_raw_confidence_mean_1d" in row for row in feature_rows)
+    assert all("llm_uncertainty_mean_1d" in row for row in feature_rows)
 
     expected_available_at = parse_utc("2026-07-06T22:00:00Z")
     expected_decision = parse_utc("2026-07-07T20:00:00Z")
@@ -294,6 +357,10 @@ def test_apply_mode_is_per_entity_and_abstention_preserves_deterministic_signal(
         parse_utc(str(row["available_at"]))
         for row in _partition_rows(applied_outputs, "llm_annotations")
     } == {expected_available_at}
+    assert {
+        parse_utc(str(row["decision_time"]))
+        for row in _partition_rows(applied_outputs, "llm_annotations")
+    } == {expected_decision}
     for signal in applied.values():
         available_at = parse_utc(str(signal["available_at"]))
         asof_ts = parse_utc(str(signal["asof_ts"]))
@@ -342,7 +409,7 @@ def test_identical_text_items_share_one_generation_and_one_run_response_artifact
     configured = _enabled_llm_config(
         generated_config.model_copy(update={"paths": paths}),
         tmp_path,
-        apply_to_features=False,
+        feature_mode="sidecar",
     )
     generated_request_counts: list[int] = []
 
@@ -355,3 +422,54 @@ def test_identical_text_items_share_one_generation_and_one_run_response_artifact
     assert generated_request_counts == [1]
     assert len(outputs["llm_annotation_responses"]) == 1
     assert len(_partition_rows(outputs, "llm_annotations")) == 2
+    rounds = replay_decision_rounds_jsonl(Path(str(outputs["llm_decision_rounds"])))
+    assert [round.inference_source for round in rounds] == ["generated", "deduplicated"]
+
+
+def test_augment_backtest_emits_matched_llm_ablation_without_promotion_claim(
+    generated_config: ResearchConfig,
+    tmp_path: Path,
+) -> None:
+    configured = _enabled_llm_config(
+        generated_config,
+        tmp_path,
+        feature_mode="augment",
+    )
+
+    def fake_generator(requests: list[GenerationRequest]) -> list[GenerationResponse]:
+        responses: list[GenerationResponse] = []
+        for request in requests:
+            payload = _input_payload(request)
+            candidates = payload["candidates"]
+            assert isinstance(candidates, list)
+            responses.append(
+                _response(
+                    request,
+                    [_positive_annotation(str(candidate["asset_id"])) for candidate in candidates],
+                )
+            )
+        return responses
+
+    outputs = backtest(configured, llm_generator=fake_generator)
+    comparison = json.loads(
+        Path(str(outputs["llm_ablation_comparison"])).read_text(encoding="utf-8")
+    )
+
+    assert "not evidence" in comparison["interpretation"]
+    assert set(comparison["family_semantics"]) == {
+        "traditional",
+        "text",
+        "combined",
+        "llm",
+        "traditional_llm",
+        "all",
+    }
+    assert set(comparison["development"]) == {
+        "llm_only_vs_conventional_text",
+        "numeric_plus_llm_vs_numeric",
+        "all_vs_numeric_plus_conventional_text",
+    }
+    assert set(comparison["final_holdout"]) == set(comparison["development"])
+    for window in ("development", "final_holdout"):
+        for values in comparison[window].values():
+            assert "enhanced_minus_baseline" in values

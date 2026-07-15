@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from math import isclose
 from pathlib import Path
@@ -169,6 +170,10 @@ def test_feature_builder_emits_text_and_traditional_families(tmp_path: Path) -> 
     assert row["event_item_count_3d"] == 1
     assert row["event_earnings_count_3d"] == 1
     assert row["event_guidance_count_3d"] == 0
+    assert row["llm_annotation_count_3d"] == 0
+    assert row["llm_annotation_coverage_3d"] == 0.0
+    assert row["llm_missing_3d"] is True
+    assert row["llm_semantic_missing_3d"] is True
 
     assert row["price_basis"] == "causal_return_adjustment_factor"
     assert row["return_5d_missing"] is False
@@ -177,6 +182,115 @@ def test_feature_builder_emits_text_and_traditional_families(tmp_path: Path) -> 
     assert row["market_beta_60d_missing"] is False
     assert row["sector_data_missing"] is True
     assert row["earnings_proximity_missing"] is True
+
+
+def test_llm_features_are_separate_novelty_filtered_and_point_in_time(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    annotated_positive = replace(
+        _signal("llm-positive", 8, 1.0, novelty=1.0, event_type="earnings"),
+        llm_semantic_signal=2,
+        llm_raw_confidence=0.8,
+        llm_uncertainty=0.1,
+        llm_event_type="earnings",
+        llm_event_confidence=0.7,
+        llm_supporting_evidence_count=2,
+        llm_counterevidence_count=0,
+        llm_abstained=False,
+    )
+    annotated_negative = replace(
+        _signal("llm-negative", 9, -1.0, novelty=1.0, event_type="guidance"),
+        llm_semantic_signal=-1,
+        llm_raw_confidence=0.2,
+        llm_uncertainty=0.6,
+        llm_event_type="guidance",
+        llm_event_confidence=0.3,
+        llm_supporting_evidence_count=1,
+        llm_counterevidence_count=2,
+        llm_abstained=False,
+    )
+    abstained = replace(
+        _signal("llm-abstained", 9, 0.25, novelty=1.0, event_type="earnings"),
+        llm_raw_confidence=0.0,
+        llm_uncertainty=1.0,
+        llm_event_confidence=0.0,
+        llm_supporting_evidence_count=0,
+        llm_counterevidence_count=0,
+        llm_abstained=True,
+    )
+    unannotated = _signal("unannotated", 9, 0.5, novelty=1.0, event_type="earnings")
+    copied = replace(
+        _signal("copied", 9, -0.5, novelty=0.0, event_type="guidance"),
+        llm_semantic_signal=-2,
+        llm_raw_confidence=1.0,
+        llm_uncertainty=0.0,
+        llm_event_confidence=1.0,
+        llm_supporting_evidence_count=99,
+        llm_counterevidence_count=0,
+        llm_abstained=False,
+    )
+    future = replace(
+        _signal("future-llm", 10, 1.0, novelty=1.0, event_type="earnings"),
+        llm_semantic_signal=2,
+        llm_raw_confidence=1.0,
+        llm_uncertainty=0.0,
+        llm_event_confidence=1.0,
+        llm_supporting_evidence_count=99,
+        llm_counterevidence_count=0,
+        llm_abstained=False,
+    )
+
+    rows = build_feature_rows(
+        _bars(),
+        [annotated_positive, annotated_negative, abstained, unannotated, copied, future],
+        config,
+    )
+    row = next(
+        value
+        for value in rows
+        if value["symbol"] == "AAA" and value["asof_ts"].startswith("2026-07-09")
+    )
+
+    assert row["text_count_3d"] == 4
+    assert row["raw_text_count_3d"] == 5
+    assert row["sentiment_mean_3d"] == pytest.approx(0.1875)
+    assert row["llm_annotation_count_3d"] == 3
+    assert row["llm_non_abstention_count_3d"] == 2
+    assert row["llm_annotation_coverage_3d"] == pytest.approx(0.75)
+    assert row["llm_abstention_rate_3d"] == pytest.approx(1.0 / 3.0)
+    assert row["llm_semantic_mean_3d"] == pytest.approx(0.5)
+    assert row["llm_raw_confidence_mean_3d"] == pytest.approx(0.5)
+    assert row["llm_uncertainty_mean_3d"] == pytest.approx(1.7 / 3.0)
+    assert row["llm_event_confidence_mean_3d"] == pytest.approx(0.5)
+    assert row["llm_supporting_evidence_count_3d"] == 3
+    assert row["llm_counterevidence_count_3d"] == 2
+    assert row["llm_evidence_agreement_3d"] == pytest.approx(0.6)
+    assert row["llm_missing_3d"] is False
+    assert row["llm_semantic_missing_3d"] is False
+    assert row["llm_event_confidence_missing_3d"] is False
+    assert row["llm_evidence_missing_3d"] is False
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"llm_semantic_signal": 3}, "llm_semantic_signal"),
+        ({"llm_raw_confidence": 1.1}, "llm_raw_confidence"),
+        ({"llm_uncertainty": -0.1}, "llm_uncertainty"),
+        ({"llm_supporting_evidence_count": -1}, "supporting_evidence"),
+        ({"llm_counterevidence_count": 1.5}, "counterevidence"),
+        ({"llm_abstained": 1}, "llm_abstained"),
+    ],
+)
+def test_text_signal_validates_llm_annotation_fields(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    signal = _signal("validation", 9, 0.5, novelty=1.0, event_type="earnings")
+
+    with pytest.raises(ValueError, match=message):
+        replace(signal, **updates)
 
 
 def test_labels_use_adjusted_prices_and_future_only_supported_targets(tmp_path: Path) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
 import time as clock
 from bisect import bisect_left
@@ -33,6 +35,7 @@ from nlp_trader.models.evaluation import evaluate_predictions
 from nlp_trader.nlp.llm_annotations import (
     AnnotationRequest,
     AnnotationResponse,
+    AnnotationVerification,
     AssetCandidate,
     CachedLocalLLMAnnotator,
     EntityAnnotation,
@@ -41,7 +44,19 @@ from nlp_trader.nlp.llm_annotations import (
     LLMAnnotationConfig,
     build_annotation_request,
 )
-from nlp_trader.nlp.simple import build_text_signals, link_entities
+from nlp_trader.nlp.llm_decision_rounds import (
+    CurrentSourceRetrieval,
+    DecisionRound,
+    DecisionRoundLedger,
+    InferenceUsage,
+    ModelIdentity,
+    RawGeneration,
+    SamplingSettings,
+    VerifierCheck,
+    VerifierResult,
+    VersionedContract,
+)
+from nlp_trader.nlp.simple import SOURCE_CREDIBILITY, build_text_signals, link_entities
 from nlp_trader.nlp.transformer import (
     CachedTransformerSentiment,
     TransformerSentimentConfig,
@@ -122,6 +137,25 @@ def _write_text_once(path: Path, value: str) -> Path:
     return path
 
 
+def _numeric_metric_deltas(
+    baseline: dict[str, Any],
+    enhanced: dict[str, Any],
+) -> dict[str, float]:
+    deltas: dict[str, float] = {}
+    for name in sorted(set(baseline) & set(enhanced)):
+        left = baseline[name]
+        right = enhanced[name]
+        if isinstance(left, bool) or isinstance(right, bool):
+            continue
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            continue
+        left_value = float(left)
+        right_value = float(right)
+        if math.isfinite(left_value) and math.isfinite(right_value):
+            deltas[name] = right_value - left_value
+    return deltas
+
+
 def _runtime_bound(value: str | None, *, end: bool) -> datetime | None:
     if value is None:
         return None
@@ -152,6 +186,14 @@ def _signal_to_record(signal: TextSignal) -> dict[str, Any]:
         "event_type": signal.event_type,
         "spam_score": signal.spam_score,
         "disagreement": signal.disagreement,
+        "llm_semantic_signal": signal.llm_semantic_signal,
+        "llm_raw_confidence": signal.llm_raw_confidence,
+        "llm_uncertainty": signal.llm_uncertainty,
+        "llm_event_type": signal.llm_event_type,
+        "llm_event_confidence": signal.llm_event_confidence,
+        "llm_supporting_evidence_count": signal.llm_supporting_evidence_count,
+        "llm_counterevidence_count": signal.llm_counterevidence_count,
+        "llm_abstained": signal.llm_abstained,
     }
 
 
@@ -751,12 +793,16 @@ class PipelineExecution:
                 model_license_or_terms_ref=configured.model_license_or_terms_ref,
                 prompt_version=configured.prompt_version,
                 schema_version=configured.schema_version,
+                verifier_version=configured.verifier_version,
                 cache_dir=self.config.paths.models_dir / "_cache" / "llm_annotations",
+                attempt_dir=(self.context.paths.models / "llm_annotations" / "generation_attempts"),
                 batch_size=configured.batch_size,
                 max_input_tokens=configured.max_input_tokens,
                 max_new_tokens=configured.max_new_tokens,
                 decoding=configured.decoding,
                 seed=configured.seed,
+                input_cost_per_million_tokens_usd=(configured.input_cost_per_million_tokens_usd),
+                output_cost_per_million_tokens_usd=(configured.output_cost_per_million_tokens_usd),
                 local_files_only=configured.local_files_only,
                 trust_remote_code=configured.trust_remote_code,
             ),
@@ -773,6 +819,7 @@ class PipelineExecution:
             raise ValueError("configured local LLM model changed after run input capture")
         assets_by_id = self._assets_by_id()
         calendar = self._calendar()
+        market_decision_times = sorted(self.market_decision_times_by_session.values())
         requests: list[AnnotationRequest] = []
         expected_assets: dict[str, tuple[str, ...]] = {}
         for item in sorted(self.items, key=lambda value: (value.available_at, value.item_id)):
@@ -799,7 +846,22 @@ class PipelineExecution:
                 )
                 for asset_id in sorted(candidate_assets)
             )
-            request = build_annotation_request(item, candidates)
+            decision_index = bisect_left(
+                market_decision_times,
+                item.available_at.astimezone(UTC),
+            )
+            decision_time = (
+                market_decision_times[decision_index]
+                if decision_index < len(market_decision_times)
+                else calendar.next_decision_time(item.available_at)
+            )
+            request = build_annotation_request(
+                item,
+                candidates,
+                decision_time=decision_time,
+                target_horizon_days=self.config.features.horizon_days,
+                source_quality=SOURCE_CREDIBILITY.get(item.source_type, 0.5),
+            )
             requests.append(request)
             expected_assets[item.item_id] = tuple(candidate.asset_id for candidate in candidates)
 
@@ -834,7 +896,7 @@ class PipelineExecution:
                 "run_id": self.context.run_id,
                 "model_directory_sha256": model_manifest["sha256"],
                 "model_license_or_terms_ref": configured.model_license_or_terms_ref,
-                "apply_to_features": configured.apply_to_features,
+                "feature_mode": configured.feature_mode,
                 "retrospective_parser": True,
                 "source_availability_policy": (
                     "annotations inherit each source item's available_at; annotation stage "
@@ -844,6 +906,7 @@ class PipelineExecution:
                 "cache_hit_count": annotator.cache_hit_count,
                 "generation_request_count": annotator.generation_request_count,
                 "deduplicated_request_count": annotator.deduplicated_request_count,
+                "generation_attempt_count": len(annotator.attempt_paths),
             }
         )
         provenance_path = _write_json_once(
@@ -855,8 +918,10 @@ class PipelineExecution:
         for request in requests:
             requests_by_cache_key.setdefault(annotator.cache_key_for(request), []).append(request)
         response_paths: list[str] = []
+        cache_records_by_key: dict[str, dict[str, Any]] = {}
         for cache_key, matching_requests in sorted(requests_by_cache_key.items()):
             cache_record = annotator.cache_record_for(matching_requests[0])
+            cache_records_by_key[cache_key] = cache_record
             cache_record["run_request"] = {
                 "item_ids": [request.item_id for request in matching_requests]
             }
@@ -867,8 +932,11 @@ class PipelineExecution:
             response_paths.append(str(response_path))
 
         annotation_records: list[dict[str, Any]] = []
+        verifications: dict[str, AnnotationVerification] = {}
         for request in requests:
             response = responses_by_item[request.item_id]
+            verification = annotator.verification_for(request, response)
+            verifications[request.item_id] = verification
             item = item_by_id[request.item_id]
             for annotation in response.annotations:
                 asset = assets_by_id[annotation.asset_id]
@@ -885,22 +953,151 @@ class PipelineExecution:
                         "asset_id": annotation.asset_id,
                         "symbol": asset.symbol,
                         "available_at": format_utc(item.available_at),
+                        "decision_time": format_utc(request.decision_time),
                         "stance_label": annotation.stance_label,
-                        "stance_confidence": annotation.stance_confidence,
+                        "semantic_signal": annotation.semantic_signal,
+                        "raw_confidence": annotation.raw_confidence,
                         "uncertainty": annotation.uncertainty,
+                        "horizon_days": annotation.horizon_days,
                         "primary_event_type": annotation.primary_event_type,
                         "event_confidence": annotation.event_confidence,
-                        "evidence_span_ids": annotation.evidence_span_ids,
+                        "supporting_evidence_span_ids": (annotation.supporting_evidence_span_ids),
+                        "counterevidence_span_ids": annotation.counterevidence_span_ids,
+                        "mechanism": annotation.mechanism,
+                        "invalidation_conditions": annotation.invalidation_conditions,
                         "abstain_reason": annotation.abstain_reason,
+                        "source_type": request.source_type,
+                        "source_quality": request.source_quality,
                         "model_id": configured.model_id,
                         "model_revision": configured.model_revision,
                         "prompt_version": configured.prompt_version,
                         "schema_version": configured.schema_version,
+                        "verifier_version": configured.verifier_version,
+                        "verification_valid": verification.valid,
                         "model_directory_sha256": model_manifest["sha256"],
                         "retrospective_parser": True,
                         "year": item.available_at.year,
                     }
                 )
+
+        decision_rounds: list[DecisionRound] = []
+        input_snapshot_hash = hashlib.sha256(
+            json.dumps(
+                [
+                    {
+                        "role": entry["role"],
+                        "sha256": entry.get("sha256"),
+                        "exists": entry["exists"],
+                    }
+                    for entry in self.context.inputs
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        for request in requests:
+            cache_key = annotator.cache_key_for(request)
+            cache_record = cache_records_by_key[cache_key]
+            generation = cache_record["generation"]
+            if not isinstance(generation, dict):
+                raise ValueError("LLM cache generation metadata must be an object")
+            response = responses_by_item[request.item_id]
+            verification = verifications[request.item_id]
+            inference_source = annotator.inference_source_for(request)
+            generated_in_this_round = inference_source == "generated"
+            token_rates_configured = (
+                configured.input_cost_per_million_tokens_usd is not None
+                and configured.output_cost_per_million_tokens_usd is not None
+            )
+            raw_latency = generation.get("generation_latency_seconds")
+            decision_rounds.append(
+                DecisionRound(
+                    run_id=self.context.run_id,
+                    config_hash=self.config.content_hash(),
+                    input_snapshot_hash=input_snapshot_hash,
+                    item_id=request.item_id,
+                    source_text_hash=request.source_text_hash,
+                    source_available_at=request.source_available_at,
+                    decision_time=request.decision_time,
+                    horizon_days=request.target_horizon_days,
+                    model=ModelIdentity(
+                        provider=configured.backend,
+                        model_id=configured.model_id,
+                        revision=configured.model_revision,
+                        sha256=str(model_manifest["sha256"]),
+                    ),
+                    prompt=VersionedContract(
+                        version=configured.prompt_version,
+                        sha256=str(provenance["prompt_sha256"]),
+                    ),
+                    schema_contract=VersionedContract(
+                        version=configured.schema_version,
+                        sha256=str(provenance["schema_sha256"]),
+                    ),
+                    sampling=SamplingSettings(
+                        decoding=configured.decoding,
+                        seed=configured.seed,
+                        max_input_tokens=configured.max_input_tokens,
+                        max_new_tokens=configured.max_new_tokens,
+                    ),
+                    retrieval=CurrentSourceRetrieval(
+                        evidence_ids=tuple(span.span_id for span in request.evidence_spans)
+                    ),
+                    raw_generation=RawGeneration(
+                        request_id=str(generation["request_id"]),
+                        generated_text=generation.get("generated_text"),
+                        input_too_long=bool(generation.get("input_too_long", False)),
+                        output_truncated=bool(generation.get("output_truncated", False)),
+                        metadata={
+                            "original_input_token_count": generation.get("input_token_count"),
+                            "original_output_token_count": generation.get("output_token_count"),
+                            "original_generation_latency_seconds": raw_latency,
+                            "original_estimated_cost_usd": generation.get("estimated_cost_usd"),
+                        },
+                    ),
+                    structured_output=response.to_dict(),
+                    verifier=VerifierResult(
+                        version=configured.verifier_version,
+                        passed=verification.valid,
+                        checks=tuple(
+                            VerifierCheck(
+                                check_id=check.name,
+                                passed=check.passed,
+                                detail=check.detail,
+                            )
+                            for check in verification.checks
+                        ),
+                    ),
+                    inference_source=inference_source,
+                    usage=InferenceUsage(
+                        input_tokens=(
+                            generation.get("input_token_count") if generated_in_this_round else 0
+                        ),
+                        output_tokens=(
+                            generation.get("output_token_count") if generated_in_this_round else 0
+                        ),
+                        latency_ms=(
+                            float(raw_latency) * 1000.0
+                            if generated_in_this_round and raw_latency is not None
+                            else 0.0
+                        ),
+                        estimated_usd_cost=(
+                            generation.get("estimated_cost_usd")
+                            if generated_in_this_round
+                            else 0.0
+                            if token_rates_configured
+                            else None
+                        ),
+                    ),
+                    application_mode=configured.feature_mode,
+                )
+            )
+        decision_ledger_path = self.context.paths.models / "llm_decisions" / "rounds.jsonl"
+        decision_ledger = DecisionRoundLedger(decision_ledger_path)
+        decision_ledger.write_exclusive(decision_rounds)
+        replayed_rounds = decision_ledger.replay_and_verify()
+        if len(replayed_rounds) != len(decision_rounds):
+            raise ValueError("LLM decision-round replay coverage mismatch")
 
         silver_paths = write_partitioned_parquet(
             annotation_records,
@@ -910,11 +1107,46 @@ class PipelineExecution:
             max_rows_per_file=self.config.data.write_batch_rows,
         )
         abstentions = sum(record["stance_label"] == "abstain" for record in annotation_records)
-        cited_annotations = sum(bool(record["evidence_span_ids"]) for record in annotation_records)
+        cited_annotations = sum(
+            bool(record["supporting_evidence_span_ids"]) for record in annotation_records
+        )
+        counterevidence_annotations = sum(
+            bool(record["counterevidence_span_ids"]) for record in annotation_records
+        )
+        verification_checks = [
+            check for verification in verifications.values() for check in verification.checks
+        ]
+        verification_summary = {
+            "artifact_schema_version": "llm-annotation-verification-summary-v1",
+            "verifier_version": configured.verifier_version,
+            "request_count": len(requests),
+            "valid_request_count": sum(value.valid for value in verifications.values()),
+            "invalid_request_count": sum(not value.valid for value in verifications.values()),
+            "check_counts": {
+                name: {
+                    "passed": sum(
+                        check.passed for check in verification_checks if check.name == name
+                    ),
+                    "failed": sum(
+                        not check.passed for check in verification_checks if check.name == name
+                    ),
+                }
+                for name in sorted({check.name for check in verification_checks})
+            },
+            "scope_note": (
+                "deterministic checks validate identity, timing, horizon, evidence references, "
+                "and cited numeric tokens; they do not prove that prose claims are semantically "
+                "true"
+            ),
+        }
+        verification_summary_path = _write_json_once(
+            self.context.paths.processed / "evaluation" / "llm_verification_summary.json",
+            verification_summary,
+        )
         self.llm_annotation_summary = {
-            "artifact_schema_version": "llm-annotation-summary-v1",
+            "artifact_schema_version": "llm-semantic-signal-summary-v2",
             "enabled": True,
-            "apply_to_features": configured.apply_to_features,
+            "feature_mode": configured.feature_mode,
             "retrospective_parser": True,
             "text_item_count": len(self.items),
             "request_count": len(requests),
@@ -925,6 +1157,7 @@ class PipelineExecution:
                 abstentions / len(annotation_records) if annotation_records else 0.0
             ),
             "cited_annotation_count": cited_annotations,
+            "counterevidence_annotation_count": counterevidence_annotations,
             "event_annotation_count": sum(
                 record["primary_event_type"] is not None for record in annotation_records
             ),
@@ -932,10 +1165,16 @@ class PipelineExecution:
             "cache_hit_count": annotator.cache_hit_count,
             "generation_request_count": annotator.generation_request_count,
             "deduplicated_request_count": annotator.deduplicated_request_count,
+            "generation_attempt_count": len(annotator.attempt_paths),
+            "generated_input_token_count": annotator.generated_input_token_count,
+            "generated_output_token_count": annotator.generated_output_token_count,
+            "generation_latency_seconds": annotator.generation_latency_seconds,
+            "estimated_inference_cost_usd": annotator.estimated_inference_cost_usd,
             "model_id": configured.model_id,
             "model_revision": configured.model_revision,
             "prompt_version": configured.prompt_version,
             "schema_version": configured.schema_version,
+            "verifier_version": configured.verifier_version,
             "model_directory_sha256": model_manifest["sha256"],
         }
         summary_path = _write_json_once(
@@ -948,8 +1187,13 @@ class PipelineExecution:
                 "llm_annotation_schema": schema_path,
                 "llm_annotation_provenance": provenance_path,
                 "llm_annotation_responses": response_paths,
+                "llm_annotation_generation_attempts": [
+                    str(path) for path in annotator.attempt_paths
+                ],
                 "llm_annotations": [str(path) for path in silver_paths],
                 "llm_annotation_summary": summary_path,
+                "llm_verification_summary": verification_summary_path,
+                "llm_decision_rounds": decision_ledger_path,
             }
         )
 
@@ -1010,33 +1254,7 @@ class PipelineExecution:
             transformer_result = transformer_results.get(signal.item_id)
             llm_annotation = self.llm_annotations.get((signal.item_id, signal.asset_id))
             overrides: dict[str, Any] = {"asof_ts": decision_time}
-            if (
-                self.config.llm_annotations.apply_to_features
-                and llm_annotation is not None
-                and llm_annotation.stance_label != "abstain"
-            ):
-                direction = {
-                    "positive": 1.0,
-                    "negative": -1.0,
-                    "neutral": 0.0,
-                }[llm_annotation.stance_label]
-                overrides.update(
-                    {
-                        "sentiment_score": direction * llm_annotation.stance_confidence,
-                        "sentiment_label": llm_annotation.stance_label,
-                        "sentiment_confidence": llm_annotation.stance_confidence,
-                        "event_type": llm_annotation.primary_event_type,
-                        "model_version": (
-                            f"llm:{self.config.llm_annotations.model_id}@"
-                            f"{self.config.llm_annotations.model_revision}:"
-                            f"{self.config.llm_annotations.prompt_version}:"
-                            f"{self.config.llm_annotations.schema_version}"
-                        ),
-                    }
-                )
-            elif (
-                not self.config.llm_annotations.apply_to_features and transformer_result is not None
-            ):
+            if transformer_result is not None:
                 score, label, confidence = transformer_result
                 overrides.update(
                     {
@@ -1044,6 +1262,21 @@ class PipelineExecution:
                         "sentiment_label": label,
                         "sentiment_confidence": confidence,
                         "model_version": self.config.transformer.model_version,
+                    }
+                )
+            if self.config.llm_annotations.feature_mode == "augment" and llm_annotation is not None:
+                overrides.update(
+                    {
+                        "llm_semantic_signal": llm_annotation.semantic_signal,
+                        "llm_raw_confidence": llm_annotation.raw_confidence,
+                        "llm_uncertainty": llm_annotation.uncertainty,
+                        "llm_event_type": llm_annotation.primary_event_type,
+                        "llm_event_confidence": llm_annotation.event_confidence,
+                        "llm_supporting_evidence_count": len(
+                            llm_annotation.supporting_evidence_span_ids
+                        ),
+                        "llm_counterevidence_count": len(llm_annotation.counterevidence_span_ids),
+                        "llm_abstained": llm_annotation.stance_label == "abstain",
                     }
                 )
             self.signals.append(replace(signal, **overrides))
@@ -1116,6 +1349,7 @@ class PipelineExecution:
             min_train_rows=self.config.models.min_train_rows,
             embargo_periods=self.config.models.embargo_periods,
             final_holdout_periods=self.config.models.final_holdout_periods,
+            families=self.config.models.families,
         )
         registry = LocalModelRegistry(self.context.paths.models)
         path = registry.save_model(
@@ -1279,6 +1513,68 @@ class PipelineExecution:
             self.context.paths.processed / "evaluation" / "final_holdout_backtest_comparison.json",
             holdout_comparison,
         )
+        if self.config.llm_annotations.feature_mode == "augment":
+            ablation_pairs = {
+                "llm_only_vs_conventional_text": ("text", "llm"),
+                "numeric_plus_llm_vs_numeric": ("traditional", "traditional_llm"),
+                "all_vs_numeric_plus_conventional_text": ("combined", "all"),
+            }
+
+            def comparisons_for(
+                results: dict[str, dict[str, Any]],
+            ) -> dict[str, dict[str, Any]]:
+                comparisons: dict[str, dict[str, Any]] = {}
+                for name, (baseline_family, enhanced_family) in ablation_pairs.items():
+                    baseline_metrics = results[baseline_family]["metrics"]
+                    enhanced_metrics = results[enhanced_family]["metrics"]
+                    comparisons[name] = {
+                        "baseline_family": baseline_family,
+                        "enhanced_family": enhanced_family,
+                        "baseline_metrics": baseline_metrics,
+                        "enhanced_metrics": enhanced_metrics,
+                        "enhanced_minus_baseline": _numeric_metric_deltas(
+                            baseline_metrics,
+                            enhanced_metrics,
+                        ),
+                    }
+                return comparisons
+
+            llm_ablation = {
+                "artifact_schema_version": "llm-ablation-comparison-v1",
+                "run_id": self.context.run_id,
+                "interpretation": (
+                    "Arithmetic deltas only; positive values are not evidence of statistical "
+                    "significance, causality, profitability, or successful promotion."
+                ),
+                "family_semantics": {
+                    "traditional": "deterministic numeric market features",
+                    "text": "conventional text features without LLM columns",
+                    "combined": "traditional plus conventional text",
+                    "llm": "LLM semantic/evidence features only",
+                    "traditional_llm": "traditional plus LLM semantic/evidence features",
+                    "all": "traditional, conventional text, and LLM semantic/evidence features",
+                },
+                "development": comparisons_for(self.backtests),
+                "final_holdout": comparisons_for(self.final_holdout_backtests),
+                "intelligence_cost": {
+                    "generated_input_token_count": self.llm_annotation_summary.get(
+                        "generated_input_token_count"
+                    ),
+                    "generated_output_token_count": self.llm_annotation_summary.get(
+                        "generated_output_token_count"
+                    ),
+                    "generation_latency_seconds": self.llm_annotation_summary.get(
+                        "generation_latency_seconds"
+                    ),
+                    "estimated_inference_cost_usd": self.llm_annotation_summary.get(
+                        "estimated_inference_cost_usd"
+                    ),
+                },
+            }
+            self.outputs["llm_ablation_comparison"] = _write_json_once(
+                self.context.paths.processed / "evaluation" / "llm_ablation_comparison.json",
+                llm_ablation,
+            )
 
     def paper(self) -> None:
         rows = self.predictions.get("combined", [])
@@ -1455,17 +1751,22 @@ class PipelineExecution:
                 "model may retain facts learned during pretraining after the historical period."
             )
         if (
-            not self.config.llm_annotations.apply_to_features
+            self.config.llm_annotations.feature_mode == "sidecar"
             and not self.enable_transformer_sentiment
         ):
             values.append("Text sentiment uses a deterministic finance dictionary baseline.")
         if (
             self.config.llm_annotations.enabled
-            and not self.config.llm_annotations.apply_to_features
+            and self.config.llm_annotations.feature_mode == "sidecar"
         ):
             values.append(
                 "LLM annotations are sidecar-only in this run and do not affect features or "
                 "research results."
+            )
+        if self.config.llm_annotations.feature_mode == "augment":
+            values.append(
+                "LLM semantic features come from a retrospective pretrained parser; raw language "
+                "confidence is uncalibrated and remains separate from semantic direction."
             )
         if self.config.mode == "sample":
             values.append("No sample metric is evidence of investment profitability.")

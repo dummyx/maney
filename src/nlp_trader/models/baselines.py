@@ -35,6 +35,9 @@ FEATURE_SETS: dict[str, list[str]] = {
 FEATURE_SETS["combined"] = FEATURE_SETS["traditional"] + FEATURE_SETS["text"]
 
 BENCHMARK_FAMILIES = ("equal_weight", "momentum_only", "no_trade")
+DEFAULT_MODEL_FAMILIES = ("traditional", "text", "combined")
+LLM_MODEL_FAMILIES = ("llm", "traditional_llm", "all")
+MODEL_FAMILIES = DEFAULT_MODEL_FAMILIES + LLM_MODEL_FAMILIES
 
 _TEXT_PREFIXES = (
     "abnormal_mention_volume_",
@@ -59,6 +62,8 @@ _TEXT_PREFIXES = (
     "time_since_first_seen_",
     "unique_author_count_",
 )
+_LLM_PREFIXES = ("llm_",)
+_EXCLUDED_LLM_PREFIXES = ("llm_semantic_conf_weighted_",)
 _TRADITIONAL_PREFIXES = (
     "amihud_illiquidity_",
     "average_dollar_volume_",
@@ -230,6 +235,13 @@ def _discover_columns(features: list[dict[str, Any]]) -> dict[str, list[str]]:
     text = sorted(
         key for key in keys if key.startswith(_TEXT_PREFIXES) and "available_at" not in key
     )
+    llm = sorted(
+        key
+        for key in keys
+        if key.startswith(_LLM_PREFIXES)
+        and not key.startswith(_EXCLUDED_LLM_PREFIXES)
+        and "available_at" not in key
+    )
     traditional = sorted(
         key for key in keys if key.startswith(_TRADITIONAL_PREFIXES) and "available_at" not in key
     )
@@ -243,6 +255,9 @@ def _discover_columns(features: list[dict[str, Any]]) -> dict[str, list[str]]:
         "traditional": traditional,
         "text": text,
         "combined": traditional + text,
+        "llm": llm,
+        "traditional_llm": traditional + llm,
+        "all": traditional + text + llm,
     }
 
 
@@ -365,6 +380,7 @@ def train_baselines(
     labels: list[dict[str, Any]],
     *,
     model_version: str,
+    families: tuple[str, ...] = DEFAULT_MODEL_FAMILIES,
     min_train_rows: int = 0,
     embargo_periods: int = 0,
     final_holdout_periods: int = 0,
@@ -372,6 +388,19 @@ def train_baselines(
 ) -> dict[str, Any]:
     """Fit causal development snapshots and freeze one pre-holdout model for final testing."""
 
+    requested_families = tuple(families)
+    if not requested_families:
+        raise ValueError("model families must not be empty")
+    if len(requested_families) != len(set(requested_families)):
+        raise ValueError("model families must be unique")
+    unknown_families = sorted(set(requested_families) - set(MODEL_FAMILIES))
+    if unknown_families:
+        raise ValueError(
+            "unknown model families: "
+            + ", ".join(unknown_families)
+            + "; expected a subset of "
+            + ", ".join(MODEL_FAMILIES)
+        )
     if min_train_rows < 0:
         raise ValueError("min_train_rows must be non-negative")
     if embargo_periods < 0:
@@ -396,7 +425,8 @@ def train_baselines(
             "forward-label availability must be strictly after its decision timestamp: "
             f"{invalid_availability}"
         )
-    columns_by_family = _discover_columns(features)
+    discovered_columns = _discover_columns(features)
+    columns_by_family = {family: discovered_columns[family] for family in requested_families}
     all_columns = sorted({column for columns in columns_by_family.values() for column in columns})
     events = sorted(
         (
@@ -492,7 +522,7 @@ def train_baselines(
         }
     return {
         "model_version": model_version,
-        "training_protocol": "incremental_expanding_walk_forward_complete_cross_sections_v5",
+        "training_protocol": "incremental_expanding_walk_forward_complete_cross_sections_v6",
         "min_train_rows": min_train_rows,
         "embargo_periods": embargo_periods,
         "final_holdout_training": final_holdout_training,
