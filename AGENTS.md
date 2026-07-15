@@ -230,6 +230,10 @@ If a full gate cannot run, run targeted checks and state exactly what was skippe
 Use [`README.md`](README.md) as the entry point and [`docs/README.md`](docs/README.md) as the
 documentation map.
 
+Write `README.md` for an average engineer. Keep it practical and use plain language. Avoid
+unexplained trading, research, storage, or machine-learning jargon; define any term that must remain
+and link detailed contracts to their canonical document.
+
 | Change | Canonical documentation |
 |---|---|
 | Setup or top-level capability | `README.md`, `docs/getting_started.md` |

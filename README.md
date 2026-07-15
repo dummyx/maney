@@ -2,52 +2,21 @@
 
 [日本語で読む](README.ja.md)
 
-NLP Trader is a local-first research pipeline for studying whether permitted text data—news,
-filings, transcripts, social exports, and commentary—adds useful information beyond traditional
-market data.
+NLP Trader runs repeatable trading-strategy experiments from local files. It helps answer one
+question: does text you are allowed to use add useful information beyond price and volume data?
 
-> This repository produces hypothetical, assumption-dependent research. It is not financial advice
-> and does not establish that a strategy is profitable. Research and paper commands never route
-> orders; the separate, explicitly invoked [kabuS broker adapter](docs/broker.md) can place real
-> cash-equity orders.
+The project is designed for research on a laptop. It records the inputs, settings, code version,
+and results for every run so another engineer can inspect or repeat the work.
 
-## The project in one minute
+> All results are hypothetical. They are not financial advice and do not show that a strategy will
+> make money. Research and simulated paper-trading (`paper`) commands never send orders. The
+> separate
+> [kabuS commands](docs/broker.md) can place real stock orders when explicitly configured and
+> confirmed.
 
-The pipeline:
+## Quick start
 
-1. captures local source files byte-for-byte;
-2. normalizes market and text records into typed Parquet tables;
-3. optionally extracts source-grounded LLM semantic signals and verifies their structural,
-   temporal, evidence-reference, horizon, and numeric-token contracts;
-4. builds features using only information available by each decision time;
-5. creates forward labels separately from features;
-6. trains expanding walk-forward baseline models;
-7. compares six fixed numeric, conventional-text, and LLM feature combinations plus naive strategies
-   when the LLM augmentation experiment is enabled;
-8. runs a constrained, two-sided-cost backtest; and
-9. writes a readable research note plus an auditable run manifest.
-
-The implemented daily strategy clock is deliberately narrow. For inputs delivered after the
-official close, such as the strict Japanese contract, the decision waits for the complete session
-cross-section:
-
-```text
-official close  ->  required data available / decision  ->  first later open  ->  horizon close
- bar complete              all features known                  assumed fill        assumed fill
-```
-
-Raw open and close prices remain the simulated fill prices. Returns use only the supplied causal
-per-bar adjustment factors. See [Backtesting](docs/backtesting.md) for the exact contract.
-
-## Five-minute tour
-
-Requirements:
-
-- macOS or another Python 3.12 environment;
-- [`uv`](https://docs.astral.sh/uv/); and
-- no market-data credentials for the sample run.
-
-Install and run the deterministic synthetic example:
+You need Python 3.12 and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --locked
@@ -55,69 +24,63 @@ uv run nlp-trader validate-config --config configs/sample.yaml
 uv run nlp-trader smoke --config configs/sample.yaml
 ```
 
-A successful run prints a unique `run_id`, artifact paths, a research report, and a final manifest.
-The generated files live under gitignored `data/`, `models/`, and `reports/` run directories.
+The sample uses small, made-up files included in the repository. It needs no market-data account,
+credentials, GPU, or downloaded language model.
 
-Start with:
+When the run finishes, it prints a `run_id` and the paths it created. Start with:
 
-- `reports/sample/<run_id>/research_note.md` for the human-readable result;
-- `reports/sample/<run_id>/run.final.json` for provenance and reproducibility; and
-- `data/processed/sample/<run_id>/backtests/` for detailed replay records.
+- `reports/sample/<run_id>/research_note.md` — the readable result and its limitations;
+- `reports/sample/<run_id>/run.final.json` — the settings, input hashes, code version, and output
+  list; and
+- `data/processed/sample/<run_id>/backtests/` — detailed simulated positions, trades, and costs.
 
-The fixtures are tiny and synthetic. Their metrics test implementation behavior only; they are not
-evidence of expected returns.
+The sample numbers only confirm that the program works. They say nothing about expected returns.
 
-## What works today
+## What the program does
 
-| Area | Current implementation |
-|---|---|
-| Inputs | Local CSV, JSON, JSONL, Parquet files, or partitioned Parquet directories |
-| Storage | Content-addressed bronze; typed, partitioned Parquet silver and gold |
-| Timing | Timezone-aware UTC, XNYS and XJPX calendars, availability-aware decisions, and exchange-aware label windows |
-| Text | Deterministic preprocessing, entity linking, causal deduplication with raw-copy diagnostics, sentiment, attention, novelty, disagreement, credibility, and event features |
-| Market | Returns, momentum, liquidity, volatility, market/sector, optional point-in-time event/fundamental features, and a strict local Japanese cash-equity input contract |
-| Models | Complete-cross-section development walk-forward baselines with strict label availability and one frozen pre-boundary model for the reserved final holdout |
-| Benchmarks | Equal-weight, momentum-only, and no-trade |
-| Backtest | Raw-price next-open entry, horizon-close liquidation, costs, constraints, logs, and reports |
-| Paper | Pending simulation-only intents with a hash-chained append-only event ledger; no fills, account state, or broker connection |
-| Broker | Standalone, explicitly confirmed kabuS cash-equity operations for a private single-user installation; never called by research or paper paths |
-| Optional NLP | Cached local transformer sentiment and local generative per-entity semantic/evidence signals, both disabled by default with MPS detection and CPU fallback; LLM output is deterministically verified and recorded in replay-checked decision rounds |
-| Quality | Ruff, strict mypy, unit/property/integration/regression tests, and offline/no-sync CI checks on Ubuntu, Apple Silicon, and Windows |
+For each run, NLP Trader:
 
-## Choose a mode
+1. reads market and text files without changing the originals;
+2. makes sure each historical decision uses only information available at that time;
+3. builds model inputs and later outcomes as separate data;
+4. repeatedly trains on past periods and scores the next period;
+5. simulates entries, exits, trading costs, and limits on how much it can hold or trade; and
+6. saves a report and a machine-readable record of the run.
 
-| Config | Purpose | Data |
+The current daily simulation makes a decision only after the required data is available. A simulated
+trade starts no earlier than the next market open and ends after the configured number of trading
+days. The exact price and cost rules are documented in [Backtesting](docs/backtesting.md).
+
+The program compares market-data methods, text methods, combined methods, and simple reference
+methods such as equal weight, recent price trend, and no trade.
+
+## Choose a configuration
+
+| File | Use it for | Data source |
 |---|---|---|
-| `configs/sample.yaml` | Fast end-to-end smoke test | Checked-in synthetic fixtures |
-| `configs/backtest.yaml` | Synthetic run with stricter research assumptions | Checked-in synthetic fixtures |
-| `configs/local.yaml` | Template for larger local research | User-supplied licensed files |
-| `configs/japan_baseline.yaml` | Strict XJPX cash-equity baseline template | User-supplied permitted local exports; no data bundled |
+| `configs/sample.yaml` | Quick end-to-end check | Included made-up files |
+| `configs/backtest.yaml` | More demanding check with the included data | Included made-up files |
+| `configs/local.yaml` | Research with your own files | Local files you are allowed to use |
+| `configs/japan_baseline.yaml` | Japanese stock research | Your permitted Japanese market exports |
 
-The local templates are expected to fail validation until you provide their asset, market-bar, and
-text files. The repository does not download or bundle vendor data. For the XJPX schema and
-J-Quants V2 normalization guidance, read the [Japan cash-equity baseline](docs/japan_baseline.md).
+The two local templates fail validation until you provide their input files. The project does not
+download or include vendor data. See [Input data](docs/input_data.md) for accepted files and
+[Japan cash-equity baseline](docs/japan_baseline.md) for the Japanese format.
 
-## Common commands
+## Use your own data
 
-Every pipeline command creates a new immutable run and executes its prerequisites in that run.
-Commands do not resume or mutate an older run.
+1. Copy `configs/local.yaml` or `configs/japan_baseline.yaml`.
+2. Point it to your asset, market, and text files.
+3. Replace the example license references with records that match your data rights.
+4. Choose a date range and symbols that fit in local memory.
+5. Validate the configuration before running a backtest.
 
 ```bash
-uv run nlp-trader validate-config --config configs/sample.yaml
-uv run nlp-trader ingest-market --config configs/sample.yaml
-uv run nlp-trader ingest-text --config configs/sample.yaml
-uv run nlp-trader annotate-text --config configs/sample.yaml
-uv run nlp-trader build-features --config configs/sample.yaml
-uv run nlp-trader build-labels --config configs/sample.yaml
-uv run nlp-trader train --config configs/sample.yaml
-uv run nlp-trader predict --config configs/sample.yaml
-uv run nlp-trader backtest --config configs/sample.yaml
-uv run nlp-trader paper --config configs/sample.yaml
-uv run nlp-trader report --config configs/sample.yaml
-uv run nlp-trader smoke --config configs/sample.yaml
+uv run nlp-trader validate-config --config configs/local.yaml
+uv run nlp-trader backtest --config configs/local.yaml --limit 100
 ```
 
-Limit a local development run without losing required warm-up or splitting an asset cross-section:
+To narrow a development run:
 
 ```bash
 uv run nlp-trader backtest \
@@ -128,67 +91,70 @@ uv run nlp-trader backtest \
   --limit 100
 ```
 
-`--limit` counts complete decision timestamps, not raw rows. The pipeline still loads configured
-market/text warm-up and label/event lookahead around the requested interval.
+Each research command creates a new run directory. It does not overwrite or continue an older run.
+See [Workflows](docs/workflows.md) for all commands and the work each one performs first.
 
-Broker operations are a separate CLI and configuration category:
+## Optional language-model text analysis
 
-```bash
-uv run nlp-trader broker --help
-```
+Large language model (LLM) support is off by default and requires a model already stored on the
+machine. Tests do not download one.
 
-Run them only on the same Windows PC as kabuStation. The validation environment returns fixed test
-responses; production can place real orders. Review the private single-user terms boundary and all
-operational safeguards in the [Broker integration guide](docs/broker.md) before use.
+When enabled, the model reads one text item at a time and returns a structured interpretation for
+each company that the program matched in that item. The result includes positive or negative
+direction, uncertainty, a time window, cited passages, possible events, and reasons the
+interpretation could be wrong.
+
+The program checks the output format, timing, whether every expected company has a result, and
+cited passage IDs. It also checks that any number in the model's explanation appears in a cited
+passage. These checks catch malformed or inconsistent output; they cannot prove that the source or
+the model's interpretation is true.
+
+LLM values are stored separately from the normal text score. A research run can compare market data,
+normal text analysis, LLM analysis, and their combinations without replacing the original inputs.
+The model's confidence number is kept as a separate input. It is not treated as a tested probability
+or a position size.
+
+The LLM never creates orders. It receives no prices, future outcomes, current simulated holdings,
+web results, or other documents. A modern model may already know facts learned after the historical
+date, so this test cannot show what the same model would have produced at that past date.
+
+For setup and output details, read [Configuration](docs/configuration.md),
+[Features and models](docs/features_and_models.md), and [Outputs](docs/outputs.md).
+
+## Important limits
+
+- A good historical result does not imply a good future result.
+- Trading fees, the difference between buy and sell prices, trade-driven price movement,
+  short-selling costs, and practical trade size are estimates. This is not a full exchange or broker
+  simulator.
+- Repeatedly changing a strategy after looking at its final evaluation period makes that evaluation
+  unreliable.
+- The files you provide must correctly show which stocks existed, which version of each report was
+  available, and when the program could have seen each value.
+- Large runs eventually load intermediate tables into RAM. Start with date, stock symbol, and
+  `--limit` filters.
+- Optional language-model tools use local model files only. The default sample does not need
+  PyTorch.
+- The project does not scrape websites or provide a market-data downloader.
 
 ## Documentation
 
-The [documentation home](docs/README.md) offers reading paths for first-time users, researchers, and
-contributors.
+You do not need to read every document. Start with the page that matches your task:
 
-| If you want to… | Read |
+| Task | Guide |
 |---|---|
-| Run the sample and understand success | [Getting started](docs/getting_started.md) |
-| Prepare a strict XJPX local baseline | [Japan cash-equity baseline](docs/japan_baseline.md) |
-| Configure local research | [Configuration reference](docs/configuration.md) |
-| Prepare input files | [Input data guide](docs/input_data.md) |
-| Choose and run a CLI stage | [Workflows and commands](docs/workflows.md) |
-| Find reports, manifests, and Parquet tables | [Outputs and artifacts](docs/outputs.md) |
-| Understand point-in-time rules | [Data contracts](docs/data_contracts.md) |
-| Understand features and walk-forward scores | [Features and models](docs/features_and_models.md) |
-| Interpret a backtest | [Backtesting](docs/backtesting.md) |
-| Design a defensible experiment | [Research protocol](docs/research_protocol.md) |
-| Configure or operate the standalone kabuS adapter | [Broker integration](docs/broker.md) |
-| Diagnose a failure | [Troubleshooting](docs/troubleshooting.md) |
-| Change the code safely | [Development guide](docs/development.md) |
-| Review licensing and safety boundaries | [Compliance](docs/compliance.md) |
+| Install and run the sample | [Getting started](docs/getting_started.md) |
+| Prepare local files | [Input data](docs/input_data.md) |
+| Change settings | [Configuration](docs/configuration.md) |
+| Run a command | [Workflows](docs/workflows.md) |
+| Find and understand results | [Outputs](docs/outputs.md) |
+| Understand historical-data rules | [Data contracts](docs/data_contracts.md) |
+| Understand the simulation | [Backtesting](docs/backtesting.md) |
+| Design a sound experiment | [Research protocol](docs/research_protocol.md) |
+| Change the code | [Development](docs/development.md) |
+| Review data rights and safety | [Compliance](docs/compliance.md) |
 
-## Important limitations
-
-- Full mode is not end-to-end out-of-core. Source scans are filtered lazily, but downstream working
-  sets are materialized; use date, symbol, and decision limits sized to local memory.
-- The configured final holdout is reported separately, but repeated human inspection invalidates it;
-  no combinatorial purged-fold or statistical-significance study is created automatically.
-- Fill, spread, impact, borrow, and capacity calculations are configurable research proxies, not a
-  venue or broker simulator.
-- Provider-specific revision history, survivorship-aware universes, and licensed historical source
-  quality remain the researcher’s responsibility.
-- With the bundled `local_files_only: true` settings, optional transformer and generative paths
-  require their models already present on the machine. Tests never download one.
-- Generative semantic signals are retrospective text parsing, not historically deployed model
-  output. A modern model may encode facts learned after the research date even when its prompt
-  contains only point-in-time text; use blinded inputs and an exact historical model when that
-  distinction matters.
-- The deterministic LLM verifier checks identity, candidate coverage, source timing, horizon,
-  evidence references, and whether numeric tokens in claims occur in cited source spans. It does not
-  prove that a prose claim or causal mechanism is true. Raw model confidence is uncalibrated and is
-  never a probability, signal magnitude, position size, or portfolio weight.
-- The current generative path uses only the current source item and host-supplied metadata. It has no
-  RAG, external retrieval, tools, model router, calibration model, or autonomous strategy-to-order
-  path.
-- There is no scraping, external market-data adapter, or autonomous strategy-to-order path. The only
-  account connection is the separately invoked, operator-confirmed kabuS adapter described in
-  [Broker integration](docs/broker.md).
+The [documentation home](docs/README.md) contains the full index.
 
 ## Development checks
 
@@ -200,12 +166,17 @@ uv run pytest
 uv run nlp-trader smoke --config configs/sample.yaml
 ```
 
-The [quality workflow](.github/workflows/quality.yml) runs on every push and pull request. Ubuntu
-runs formatting, lint, strict type checks, the full test suite, and the deterministic sample; an
-Apple Silicon runner repeats the baseline tests and sample; and Windows runs the offline broker
-boundary tests and validates the non-secret broker config. Each job installs the lockfile once, then
-uses uv's offline, no-sync mode for the checks. The optional PyTorch/MPS path is not installed or
-claimed by this workflow.
+Automated checks run the same commands for every code change. See
+[Development](docs/development.md) for the repository layout and contribution guidance.
 
-See [Development](docs/development.md) for repository structure, test layers, and extension
-checklists.
+## Separate broker commands
+
+The research pipeline does not call a broker. The kabuS commands are separate, owner-operated, and
+must be invoked explicitly on the Windows PC running kabuStation.
+
+```bash
+uv run nlp-trader broker --help
+```
+
+The validation setup returns fixed test responses. A production setup can place real orders. Read
+the [broker guide](docs/broker.md) before configuring or running it.
