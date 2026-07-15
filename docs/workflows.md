@@ -253,8 +253,9 @@ estimated cost. This first implementation has no tool, calibration, portfolio, r
 outcome content in the round.
 
 Cache replay reparses the stored raw generation and requires an exact match with the stored
-structured payload. DecisionRound validation repeats that raw/structured binding for passing rounds,
-rejects passing truncated generations, and requires cache/deduplicated rounds to carry no new
+structured payload. DecisionRound validation repeats that raw/structured binding whenever structured
+output is present, including on a failed verifier result. A truncated generation cannot carry
+structured output or a passing verifier result, and cache/deduplicated rounds cannot carry new
 inference usage. A missing ledger path is an error; an intentionally empty enabled run still writes
 and verifies an empty file.
 

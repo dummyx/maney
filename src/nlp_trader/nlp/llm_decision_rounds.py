@@ -227,8 +227,7 @@ class DecisionRound(_StrictModel):
             )
             if any(value is not None and value != 0 for value in usage_values):
                 raise ValueError("cache and deduplicated rounds cannot report new inference usage")
-        if self.verifier.passed:
-            self._validate_verified_generation_binding()
+        self._validate_generation_binding()
         expected = self.computed_round_id()
         if self.round_id and self.round_id != expected:
             raise ValueError("decision round_id does not match canonical content")
@@ -236,17 +235,25 @@ class DecisionRound(_StrictModel):
             object.__setattr__(self, "round_id", expected)
         return self
 
-    def _validate_verified_generation_binding(self) -> None:
+    def _validate_generation_binding(self) -> None:
         if self.raw_generation.output_truncated:
-            raise ValueError("a truncated generation cannot have a passing verifier result")
+            if self.structured_output is not None:
+                raise ValueError("a truncated generation cannot have structured output")
+            if self.verifier.passed:
+                raise ValueError("a truncated generation cannot have a passing verifier result")
+            return
         if self.structured_output is None:
-            raise ValueError("a passing verifier result requires structured output")
+            if self.verifier.passed:
+                raise ValueError("a passing verifier result requires structured output")
+            return
         if self.structured_output.get("item_id") != self.item_id:
             raise ValueError("structured output item_id must match the decision round")
         annotations = self.structured_output.get("annotations")
-        if not isinstance(annotations, list) or not annotations:
-            raise ValueError("verified structured output requires a nonempty annotations array")
+        if not isinstance(annotations, list):
+            raise ValueError("structured output requires an annotations array")
         if self.raw_generation.input_too_long:
+            if not annotations:
+                raise ValueError("input-too-long structured output requires canonical abstentions")
             for annotation in annotations:
                 if not isinstance(annotation, dict) or not _is_input_too_long_abstention(
                     annotation,
@@ -256,6 +263,8 @@ class DecisionRound(_StrictModel):
                         "input-too-long structured output must contain only canonical abstentions"
                     )
             return
+        if self.verifier.passed and not annotations:
+            raise ValueError("verified structured output requires a nonempty annotations array")
         raw_text = self.raw_generation.generated_text
         if raw_text is None:  # pragma: no cover - RawGeneration already enforces this
             raise ValueError("verified generation text is missing")

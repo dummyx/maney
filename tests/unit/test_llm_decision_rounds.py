@@ -285,6 +285,42 @@ def test_round_rejects_cross_field_generation_and_usage_contradictions() -> None
         DecisionRound.model_validate_json(_canonical_json(truncated))
 
 
+def test_round_binds_failed_verifier_output_to_raw_generation() -> None:
+    payload = _decision_round().model_dump(mode="json")
+    payload["round_id"] = ""
+    payload["verifier"] = {
+        "version": "semantic-evidence-verifier-v1",
+        "passed": False,
+        "checks": [{"check_id": "evidence", "passed": False, "detail": "failed"}],
+    }
+
+    validated = DecisionRound.model_validate_json(_canonical_json(payload))
+    assert validated.verifier.passed is False
+
+    payload["structured_output"]["annotations"][0]["stance_label"] = "negative"
+
+    with pytest.raises(ValidationError, match="match the raw generation"):
+        DecisionRound.model_validate_json(_canonical_json(payload))
+
+
+def test_round_rejects_structured_output_from_failed_truncated_generation() -> None:
+    payload = _decision_round().model_dump(mode="json")
+    payload["round_id"] = ""
+    payload["raw_generation"]["output_truncated"] = True
+    payload["verifier"] = {
+        "version": "semantic-evidence-verifier-v1",
+        "passed": False,
+        "checks": [{"check_id": "schema", "passed": False, "detail": "truncated"}],
+    }
+
+    with pytest.raises(ValidationError, match="cannot have structured output"):
+        DecisionRound.model_validate_json(_canonical_json(payload))
+
+    payload["structured_output"] = None
+    validated = DecisionRound.model_validate_json(_canonical_json(payload))
+    assert validated.raw_generation.output_truncated is True
+
+
 def test_round_accepts_only_canonical_verified_input_too_long_abstentions() -> None:
     payload = _decision_round().model_dump(mode="json")
     payload["round_id"] = ""

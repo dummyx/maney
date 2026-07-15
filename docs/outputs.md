@@ -253,11 +253,12 @@ it is not a full portfolio decision trace and cannot be read as an order record.
 The pipeline writes the ledger exclusively and immediately replays it. Replay rejects blank or
 partial lines, invalid UTF-8/JSON, duplicate keys, noncanonical encodings, schema/timestamp failures,
 duplicate round IDs, a missing ledger path, and content whose hash does not match `round_id`. Round
-validation also binds passing structured output to strict raw JSON, rejects a passing truncated
-generation, and requires cache/deduplicated rounds to report no new inference usage. It validates the
-exact stored stochastic output instead of calling the model again. Passing replay does not establish
-semantic truth. This file is also distinct from the backtest replay below and the separate
-hash-chained paper event ledger.
+validation also binds every present structured output, including a failed-verifier trace, to strict
+raw JSON. A truncated generation cannot carry structured output or a passing verifier result, and
+cache/deduplicated rounds cannot report new inference usage. Replay validates the exact stored
+stochastic output instead of calling the model again. Passing replay does not establish semantic
+truth. This file is also distinct from the backtest replay below and the separate hash-chained paper
+event ledger.
 
 ## Backtest JSON
 
