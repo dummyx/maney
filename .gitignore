@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+wheels/
+
+# Environments and tooling
+.env
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+
+# Local data and generated artifacts (root-anchored so source packages remain tracked)
+/data/raw/
+/data/local/
+/data/interim/
+/data/processed/
+/reports/
+/models/
+notebooks/.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+output

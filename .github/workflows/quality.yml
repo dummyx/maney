@@ -1,0 +1,92 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Ubuntu / quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UV_NO_PROGRESS: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync locked baseline and development dependencies
+        run: uv sync --locked --dev
+
+      - name: Check formatting without network access
+        run: uv run --offline --no-sync ruff format --check .
+
+      - name: Lint without network access
+        run: uv run --offline --no-sync ruff check .
+
+      - name: Type-check without network access
+        run: uv run --offline --no-sync mypy src
+
+      - name: Test without network access
+        run: uv run --offline --no-sync pytest
+
+      - name: Run deterministic sample without network access
+        run: uv run --offline --no-sync nlp-trader smoke --config configs/sample.yaml
+
+      - name: Confirm tracked files were not mutated
+        run: git diff --exit-code
+
+  apple-silicon:
+    name: macOS arm64 / baseline
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      UV_NO_PROGRESS: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Confirm Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Sync locked baseline and development dependencies
+        run: uv sync --locked --dev
+
+      - name: Test baseline without network access
+        run: uv run --offline --no-sync pytest
+
+      - name: Run deterministic sample without network access
+        run: uv run --offline --no-sync nlp-trader smoke --config configs/sample.yaml
+
+      - name: Confirm tracked files were not mutated
+        run: git diff --exit-code

@@ -1,0 +1,3 @@
+asset_id,symbol,exchange,currency,name,sector,active_from,active_to
+asset_aaa,AAA,XNAS,USD,Alpha Analytics,Technology,2026-01-01,
+asset_bbb,BBB,XNYS,USD,Beta Bancorp,Financials,2026-01-01,

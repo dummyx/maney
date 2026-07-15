@@ -1,0 +1,71 @@
+mode: sample
+paths:
+  assets: ../data/samples/assets.csv
+  market_bars: ../data/samples/market_bars.csv
+  text_items: ../data/samples/text_items.jsonl
+  raw_dir: ../data/raw
+  interim_dir: ../data/interim/sample
+  processed_dir: ../data/processed/sample
+  models_dir: ../models/sample
+  reports_dir: ../reports/sample
+data:
+  storage_format: parquet
+  compression: zstd
+  write_batch_rows: 10000
+  calendar: XNYS
+  schema_version: "1"
+  market_license_or_terms_ref: synthetic-fixture-v1
+  text_license_or_terms_ref: synthetic-fixture-v1
+features:
+  windows_days: [1, 3, 5, 20]
+  market_warmup_sessions: 60
+  text_warmup_days: 40
+  event_lookahead_days: 30
+  horizon_days: 1
+  feature_set_version: sample-v2
+  label_version: sample-v2
+  model_version: sample-walk-forward-v2
+  text_decay_half_life_days: 1.0
+  decision_time: close
+models:
+  families: [traditional, text, combined]
+  min_train_rows: 4
+  embargo_periods: 0
+  top_k: 2
+backtest:
+  commission_bps: 1.0
+  half_spread_bps: 2.0
+  slippage_bps: 1.0
+  volatility_slippage_multiplier: 0.05
+  participation_slippage_bps: 50.0
+  market_impact_multiplier: 0.1
+  borrow_bps_per_year: 0.0
+  max_position_weight: 0.5
+  max_gross_exposure: 1.0
+  max_net_exposure: 1.0
+  max_sector_weight: 0.6
+  max_beta_exposure: 1.5
+  missing_beta_fallback: 1.0
+  missing_volatility_floor: 0.03
+  max_daily_turnover: 1.0
+  same_day_exit_notional_buffer: 0.10
+  max_participation_rate: 0.05
+  min_price: 1.0
+  min_dollar_volume: 1000000.0
+  shorting_allowed: false
+  hard_to_borrow_allowed: false
+  initial_capital: 1000000.0
+  rebalance_frequency: 1d
+  benchmark: equal_weight
+runtime:
+  limit: null
+  start_date: null
+  end_date: null
+  symbols: []
+transformer:
+  enabled: false
+  model_name: null
+  model_version: local-transformer-v1
+  batch_size: 16
+  max_sequence_length: 256
+  local_files_only: true

@@ -1,0 +1,1088 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time as clock
+from dataclasses import replace
+from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+from nlp_trader.backtest.engine import DeterministicBacktestEngine
+from nlp_trader.calendars import USEquityCalendar
+from nlp_trader.config import ResearchConfig, validate_config
+from nlp_trader.data.local import asset_to_record, market_bar_to_record, text_item_to_record
+from nlp_trader.data.parquet import write_partitioned_parquet
+from nlp_trader.data.stores import (
+    ContentAddressedRawStore,
+    LocalModelRegistry,
+    ParquetFeatureStore,
+    RawIngestionRequest,
+)
+from nlp_trader.features.build import build_feature_rows, build_label_rows
+from nlp_trader.models.baselines import predict_all_families, train_baselines
+from nlp_trader.models.evaluation import evaluate_predictions
+from nlp_trader.nlp.simple import build_text_signals, link_entities
+from nlp_trader.nlp.transformer import (
+    CachedTransformerSentiment,
+    TransformerSentimentConfig,
+)
+from nlp_trader.paper.simulator import PaperOrderIntent
+from nlp_trader.portfolio.constraints import constraints_from_config
+from nlp_trader.portfolio.construction import constrain_target_weights
+from nlp_trader.portfolio.risk import conservative_risk_estimates, risk_estimate_flags
+from nlp_trader.providers import (
+    LocalFundamentalsProvider,
+    LocalMarketDataProvider,
+    LocalTextDataProvider,
+)
+from nlp_trader.reports import DEFAULT_LIMITATIONS, write_report
+from nlp_trader.research import (
+    RunContext,
+    create_run_context,
+    fail_run,
+    finalize_run,
+)
+from nlp_trader.schemas import (
+    Asset,
+    CorporateAction,
+    EarningsCalendarEvent,
+    FundamentalRecord,
+    MarketBar,
+    TextItem,
+    TextSignal,
+)
+from nlp_trader.timestamps import format_utc, parse_utc
+
+LOGGER = logging.getLogger(__name__)
+
+STAGES = (
+    "ingest_market",
+    "ingest_text",
+    "build_features",
+    "build_labels",
+    "train",
+    "predict",
+    "backtest",
+    "paper",
+    "report",
+)
+
+DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "ingest_market": (),
+    "ingest_text": (),
+    "build_features": ("ingest_market", "ingest_text"),
+    "build_labels": ("ingest_market",),
+    "train": ("build_features", "build_labels"),
+    "predict": ("train",),
+    "backtest": ("predict",),
+    "paper": ("predict",),
+    "report": ("backtest",),
+}
+
+
+def _write_json_once(path: Path, value: object) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return path
+
+
+def _runtime_bound(value: str | None, *, end: bool) -> datetime | None:
+    if value is None:
+        return None
+    if "T" in value:
+        return parse_utc(value)
+    parsed = date.fromisoformat(value)
+    return datetime.combine(parsed, time.max if end else time.min, tzinfo=UTC)
+
+
+def _signal_to_record(signal: TextSignal) -> dict[str, Any]:
+    return {
+        "item_id": signal.item_id,
+        "asset_id": signal.asset_id,
+        "symbol": signal.symbol,
+        "asof_ts": format_utc(signal.asof_ts),
+        "available_at": format_utc(signal.available_at) if signal.available_at else None,
+        "sentiment_score": signal.sentiment_score,
+        "sentiment_label": signal.sentiment_label,
+        "sentiment_confidence": signal.sentiment_confidence,
+        "relevance": signal.relevance,
+        "novelty": signal.novelty,
+        "source_credibility": signal.source_credibility,
+        "model_version": signal.model_version,
+        "source": signal.source,
+        "source_type": signal.source_type,
+        "author_hash": signal.author_hash,
+        "duplicate_cluster_id": signal.duplicate_cluster_id,
+        "event_type": signal.event_type,
+        "spam_score": signal.spam_score,
+        "disagreement": signal.disagreement,
+    }
+
+
+def _fundamental_to_record(record: FundamentalRecord) -> dict[str, Any]:
+    return {
+        "asset_id": record.asset_id,
+        "symbol": record.symbol,
+        "period_end": record.period_end.isoformat(),
+        "available_at": format_utc(record.available_at),
+        "values": dict(record.values),
+        "filing_id": record.filing_id,
+        "year": record.available_at.year,
+    }
+
+
+def _earnings_to_record(event: EarningsCalendarEvent) -> dict[str, Any]:
+    return {
+        "asset_id": event.asset_id,
+        "symbol": event.symbol,
+        "event_ts": format_utc(event.event_ts),
+        "available_at": format_utc(event.available_at),
+        "status": event.status,
+        "year": event.event_ts.year,
+    }
+
+
+def _corporate_action_to_record(action: CorporateAction) -> dict[str, Any]:
+    return {
+        "asset_id": action.asset_id,
+        "symbol": action.symbol,
+        "event_ts": format_utc(action.event_ts),
+        "available_at": format_utc(action.available_at),
+        "action_type": action.action_type,
+        "value": action.value,
+        "year": action.event_ts.year,
+    }
+
+
+class PipelineExecution:
+    """One immutable, dependency-aware local research execution."""
+
+    def __init__(
+        self,
+        config: ResearchConfig,
+        context: RunContext,
+    ) -> None:
+        self.config = config
+        self.context = context
+        self.enable_transformer_sentiment = config.transformer.enabled
+        self.outputs: dict[str, Any] = {"run_id": context.run_id}
+        self.completed: set[str] = set()
+        self.assets: list[Asset] = []
+        self.bars: list[MarketBar] = []
+        self.items: list[TextItem] = []
+        self.signals: list[TextSignal] = []
+        self.fundamentals: list[FundamentalRecord] = []
+        self.earnings_events: list[EarningsCalendarEvent] = []
+        self.corporate_actions: list[CorporateAction] = []
+        self.selected_decision_times: frozenset[datetime] | None = None
+        self.features: list[dict[str, Any]] = []
+        self.labels: list[dict[str, Any]] = []
+        self.model: dict[str, Any] = {}
+        self.predictions: dict[str, list[dict[str, Any]]] = {}
+        self.evaluation: dict[str, Any] = {}
+        self.backtests: dict[str, dict[str, Any]] = {}
+
+    @property
+    def symbols(self) -> tuple[str, ...] | None:
+        return self.config.runtime.symbols or None
+
+    @property
+    def start(self) -> datetime | None:
+        return _runtime_bound(self.config.runtime.start_date, end=False)
+
+    @property
+    def end(self) -> datetime | None:
+        return _runtime_bound(self.config.runtime.end_date, end=True)
+
+    def _runtime_context_calendar(self, *extra: datetime) -> USEquityCalendar:
+        anchors = [value for value in (*extra, self.start, self.end) if value is not None]
+        if not anchors:
+            raise ValueError("runtime context calendar requires a start or end bound")
+        dates = [value.date() for value in anchors]
+        return USEquityCalendar(
+            calendar_name=self.config.data.calendar,
+            start=min(dates) - timedelta(days=730),
+            end=max(dates) + timedelta(days=730),
+        )
+
+    @staticmethod
+    def _nearby_decision_closes(
+        calendar: USEquityCalendar, value: datetime
+    ) -> tuple[datetime, ...]:
+        local_date = value.astimezone(calendar.timezone).date()
+        return calendar.decision_times(
+            local_date - timedelta(days=10),
+            local_date + timedelta(days=10),
+        )
+
+    def _market_fetch_start(self) -> datetime | None:
+        if self.start is None:
+            return None
+        calendar = self._runtime_context_calendar()
+        first_decision = min(
+            value
+            for value in self._nearby_decision_closes(calendar, self.start)
+            if value >= self.start
+        )
+        session_date = first_decision.astimezone(calendar.timezone).date()
+        for _ in range(self.config.features.market_warmup_sessions):
+            session_date = calendar.previous_session(session_date)
+        return calendar.session_close(session_date)
+
+    def _market_fetch_end(self, decision_end: datetime | None = None) -> datetime | None:
+        anchor = decision_end or self.end
+        if anchor is None:
+            return None
+        calendar = self._runtime_context_calendar(anchor)
+        last_decision = max(
+            value for value in self._nearby_decision_closes(calendar, anchor) if value <= anchor
+        )
+        session_date = last_decision.astimezone(calendar.timezone).date()
+        for _ in range(self.config.features.horizon_days):
+            session_date = calendar.next_session(session_date)
+        return calendar.session_close(session_date)
+
+    def _text_fetch_start(self) -> datetime | None:
+        if self.start is None:
+            return None
+        return self.start - timedelta(days=self.config.features.text_warmup_days)
+
+    def _decision_data_end(self) -> datetime | None:
+        if self.selected_decision_times:
+            return max(self.selected_decision_times)
+        return self.end
+
+    def _decision_data_start(self) -> datetime | None:
+        if self.selected_decision_times:
+            return min(self.selected_decision_times)
+        return self.start
+
+    def _known_event_fetch_end(self) -> datetime | None:
+        decision_end = self._decision_data_end()
+        if decision_end is None:
+            return None
+        return decision_end + timedelta(days=self.config.features.event_lookahead_days)
+
+    def _is_decision_timestamp(self, value: str | datetime) -> bool:
+        timestamp = parse_utc(value) if isinstance(value, str) else value.astimezone(UTC)
+        in_window = (self.start is None or timestamp >= self.start) and (
+            self.end is None or timestamp <= self.end
+        )
+        return in_window and (
+            self.selected_decision_times is None or timestamp in self.selected_decision_times
+        )
+
+    def _decision_bars(self) -> list[MarketBar]:
+        return [bar for bar in self.bars if self._is_decision_timestamp(bar.ts)]
+
+    def _assets_by_id(self) -> dict[str, Asset]:
+        indexed: dict[str, Asset] = {}
+        for asset in self.assets:
+            if asset.asset_id in indexed:
+                raise ValueError(f"duplicate asset_id in asset master: {asset.asset_id}")
+            indexed[asset.asset_id] = asset
+        return indexed
+
+    @staticmethod
+    def _validate_asset_reference(
+        asset_id: str,
+        symbol: str | None,
+        assets_by_id: dict[str, Asset],
+        *,
+        role: str,
+    ) -> Asset:
+        asset = assets_by_id.get(asset_id)
+        if asset is None:
+            raise ValueError(f"{role} references unknown asset_id: {asset_id}")
+        if symbol is not None and symbol != asset.symbol:
+            raise ValueError(
+                f"{role} symbol {symbol} does not match asset master {asset.symbol} for {asset_id}"
+            )
+        return asset
+
+    def run(self, stage: str) -> None:
+        if stage not in DEPENDENCIES:
+            raise ValueError(f"unknown pipeline stage: {stage}")
+        if stage in self.completed:
+            return
+        for dependency in DEPENDENCIES[stage]:
+            self.run(dependency)
+        started = clock.monotonic()
+        LOGGER.info("stage_start run_id=%s stage=%s", self.context.run_id, stage)
+        getattr(self, stage)()
+        self.completed.add(stage)
+        LOGGER.info(
+            "stage_complete run_id=%s stage=%s elapsed_seconds=%.3f assets=%d bars=%d "
+            "text_items=%d features=%d labels=%d",
+            self.context.run_id,
+            stage,
+            clock.monotonic() - started,
+            len(self.assets),
+            len(self.bars),
+            len(self.items),
+            len(self.features),
+            len(self.labels),
+        )
+
+    def _ensure_assets(self) -> list[dict[str, Any]]:
+        if self.assets:
+            return []
+        references = self._ingest_raw(
+            "asset_master",
+            self.config.paths.assets,
+            self.config.data.market_license_or_terms_ref,
+        )
+        provider = LocalMarketDataProvider(
+            self._captured_input_path("assets", self.config.paths.assets, references),
+            self.config.paths.market_bars,
+            self.config.paths.corporate_actions,
+        )
+        self.assets = provider.fetch_assets(symbols=self.symbols)
+        if not self.assets:
+            raise ValueError("the configured asset universe is empty after runtime filters")
+        return references
+
+    def _ingest_raw(self, role: str, path: Path, license_ref: str) -> list[dict[str, Any]]:
+        store = ContentAddressedRawStore(self.config.paths.raw_dir)
+        source_paths = [path] if path.is_file() else sorted(path.rglob("*.parquet"))
+        if not source_paths:
+            raise ValueError(f"configured {role} input contains no files: {path}")
+        references: list[dict[str, Any]] = []
+        for index, source_path in enumerate(source_paths):
+            relative = (
+                source_path.name if path.is_file() else source_path.relative_to(path).as_posix()
+            )
+            artifact = store.ingest_file(
+                source_path,
+                RawIngestionRequest(
+                    source=role,
+                    vendor="local-file",
+                    license_or_terms_ref=license_ref,
+                    ingested_at=self.context.created_at,
+                    request_id=f"{self.context.run_id}-{role}-{index:06d}",
+                    schema_version=self.config.data.schema_version,
+                    fetch_params={
+                        "symbols": list(self.config.runtime.symbols),
+                        "start_date": self.config.runtime.start_date,
+                        "end_date": self.config.runtime.end_date,
+                        "limit": self.config.runtime.limit,
+                        "input_relative_path": relative,
+                    },
+                ),
+            )
+            references.append(
+                {
+                    "role": role,
+                    "input_relative_path": relative,
+                    "payload_path": str(artifact.payload_path),
+                    "metadata_path": str(artifact.metadata_path),
+                    "sha256": artifact.metadata.sha256,
+                }
+            )
+        manifest_role = "assets" if role == "asset_master" else role
+        captured_manifest = next(
+            (entry for entry in self.context.inputs if entry["role"] == manifest_role),
+            None,
+        )
+        if captured_manifest is None:
+            raise ValueError(f"run input manifest is missing role: {manifest_role}")
+        if path.is_file():
+            if len(references) != 1 or references[0]["sha256"] != captured_manifest.get("sha256"):
+                raise ValueError(f"configured {manifest_role} changed after run capture")
+        else:
+            expected = {
+                str(entry["relative_path"]): str(entry["sha256"])
+                for entry in captured_manifest.get("files", [])
+            }
+            observed = {
+                str(reference["input_relative_path"]): str(reference["sha256"])
+                for reference in references
+            }
+            if observed != expected:
+                raise ValueError(f"configured {manifest_role} directory changed after run capture")
+        return references
+
+    def _captured_input_path(
+        self,
+        role: str,
+        configured_path: Path,
+        references: list[dict[str, Any]],
+    ) -> Path:
+        """Expose immutable bronze bytes to providers without rereading mutable inputs."""
+
+        if configured_path.is_file():
+            if len(references) != 1:
+                raise ValueError(f"captured file input {role} must have one raw artifact")
+            return Path(str(references[0]["payload_path"]))
+        root = self.context.paths.interim / "captured_inputs" / role
+        for reference in references:
+            destination = root / str(reference["input_relative_path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(Path(str(reference["payload_path"])), destination)
+        return root
+
+    def ingest_market(self) -> None:
+        asset_refs = self._ingest_raw(
+            "asset_master",
+            self.config.paths.assets,
+            self.config.data.market_license_or_terms_ref,
+        )
+        bar_refs = self._ingest_raw(
+            "market_bars",
+            self.config.paths.market_bars,
+            self.config.data.market_license_or_terms_ref,
+        )
+        raw_refs = [*asset_refs, *bar_refs]
+        captured_optional: dict[str, Path] = {}
+        optional_inputs = (
+            (
+                "corporate_actions",
+                self.config.paths.corporate_actions,
+                self.config.data.market_license_or_terms_ref,
+            ),
+            (
+                "fundamentals",
+                self.config.paths.fundamentals,
+                self.config.data.market_license_or_terms_ref,
+            ),
+            (
+                "earnings_calendar",
+                self.config.paths.earnings_calendar,
+                self.config.data.market_license_or_terms_ref,
+            ),
+        )
+        for role, configured_path, license_ref in optional_inputs:
+            if configured_path is None:
+                continue
+            references = self._ingest_raw(role, configured_path, license_ref)
+            raw_refs.extend(references)
+            captured_optional[role] = self._captured_input_path(role, configured_path, references)
+        raw_path = _write_json_once(
+            self.context.paths.interim / "bronze_refs" / "market.json",
+            raw_refs,
+        )
+        provider = LocalMarketDataProvider(
+            self._captured_input_path("assets", self.config.paths.assets, asset_refs),
+            self._captured_input_path("market_bars", self.config.paths.market_bars, bar_refs),
+            captured_optional.get("corporate_actions"),
+        )
+        if self.config.runtime.limit is not None:
+            selected = provider.fetch_decision_times(
+                symbols=self.symbols,
+                start=self.start,
+                end=self.end,
+                bar_size="1d",
+                limit=self.config.runtime.limit,
+            )
+            self.selected_decision_times = frozenset(selected)
+        self.assets = provider.fetch_assets(symbols=self.symbols)
+        self.bars = provider.fetch_bars(
+            symbols=self.symbols,
+            start=self._market_fetch_start(),
+            end=self._market_fetch_end(self._decision_data_end()),
+            bar_size="1d",
+            limit=None,
+        )
+        self.bars.sort(key=lambda bar: (bar.ts, bar.symbol))
+        self.corporate_actions = provider.fetch_corporate_actions(
+            symbols=self.symbols,
+            start=self._decision_data_start(),
+            # Future-dated actions can be valid point-in-time features when they
+            # were announced before a decision.  Feature construction enforces
+            # available_at <= asof_ts before using them.
+            end=self._known_event_fetch_end(),
+        )
+        fundamentals_provider = LocalFundamentalsProvider(
+            captured_optional.get("fundamentals"),
+            captured_optional.get("earnings_calendar"),
+        )
+        self.fundamentals = fundamentals_provider.fetch_fundamentals(
+            symbols=self.symbols,
+            # A filing available before the requested research window remains
+            # the latest known filing at the first decision in that window.
+            start=None,
+            end=self._decision_data_end(),
+        )
+        self.earnings_events = fundamentals_provider.fetch_earnings_calendar(
+            symbols=self.symbols,
+            start=self._decision_data_start(),
+            # Keep known future events beyond the last market bar so proximity
+            # features at the end of the requested window are not truncated.
+            end=self._known_event_fetch_end(),
+        )
+        if not self.assets:
+            raise ValueError("the configured asset universe is empty after runtime filters")
+        if not self._decision_bars():
+            raise ValueError("no market bars remain after runtime filters")
+        assets_by_id = self._assets_by_id()
+        calendar = self._calendar()
+        for bar in self.bars:
+            asset = self._validate_asset_reference(
+                bar.asset_id, bar.symbol, assets_by_id, role="market bar"
+            )
+            session_date = bar.ts.astimezone(calendar.timezone).date()
+            if asset.active_from is not None and session_date < asset.active_from:
+                raise ValueError(f"market bar for {bar.asset_id} predates active_from")
+            if asset.active_to is not None and session_date > asset.active_to:
+                raise ValueError(f"market bar for {bar.asset_id} is after active_to")
+        for role, records in (
+            ("fundamental record", self.fundamentals),
+            ("earnings event", self.earnings_events),
+            ("corporate action", self.corporate_actions),
+        ):
+            for record in records:
+                self._validate_asset_reference(
+                    record.asset_id,
+                    record.symbol,
+                    assets_by_id,
+                    role=role,
+                )
+
+        asset_records = [asset_to_record(asset) for asset in self.assets]
+        asset_paths = write_partitioned_parquet(
+            asset_records,
+            self.context.paths.interim / "silver" / "assets",
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        bar_records: list[dict[str, Any]] = []
+        for bar in self.bars:
+            bar_record = market_bar_to_record(bar)
+            bar_record["year"] = bar.ts.year
+            bar_records.append(bar_record)
+        bar_paths = write_partitioned_parquet(
+            bar_records,
+            self.context.paths.interim / "silver" / "market",
+            partition_fields=("bar_size", "symbol", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        fundamental_paths = write_partitioned_parquet(
+            [_fundamental_to_record(record) for record in self.fundamentals],
+            self.context.paths.interim / "silver" / "fundamentals",
+            partition_fields=("symbol", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        earnings_paths = write_partitioned_parquet(
+            [_earnings_to_record(event) for event in self.earnings_events],
+            self.context.paths.interim / "silver" / "earnings_calendar",
+            partition_fields=("symbol", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        action_paths = write_partitioned_parquet(
+            [_corporate_action_to_record(action) for action in self.corporate_actions],
+            self.context.paths.interim / "silver" / "corporate_actions",
+            partition_fields=("symbol", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        self.outputs.update(
+            {
+                "raw_market_manifest": raw_path,
+                "assets": [str(path) for path in asset_paths],
+                "market": [str(path) for path in bar_paths],
+                "fundamentals": [str(path) for path in fundamental_paths],
+                "earnings_calendar": [str(path) for path in earnings_paths],
+                "corporate_actions": [str(path) for path in action_paths],
+            }
+        )
+
+    def ingest_text(self) -> None:
+        asset_refs = self._ensure_assets()
+        text_refs = self._ingest_raw(
+            "text_items",
+            self.config.paths.text_items,
+            self.config.data.text_license_or_terms_ref,
+        )
+        provider = LocalTextDataProvider(
+            self._captured_input_path("text_items", self.config.paths.text_items, text_refs)
+        )
+        selected = provider.fetch_items(
+            start=self._text_fetch_start(),
+            end=self._decision_data_end(),
+            limit=None,
+        )
+        assets_by_id = self._assets_by_id()
+        item_dates = [item.available_at.date() for item in selected]
+        calendar = USEquityCalendar(
+            calendar_name=self.config.data.calendar,
+            start=min(item_dates) - timedelta(days=14)
+            if item_dates
+            else self.context.created_at.date() - timedelta(days=14),
+            end=max(item_dates) + timedelta(days=14)
+            if item_dates
+            else self.context.created_at.date() + timedelta(days=14),
+        )
+        normalized: list[TextItem] = []
+        for item in selected:
+            for entity in item.entities:
+                if entity.asset_id is None:
+                    continue
+                asset = self._validate_asset_reference(
+                    entity.asset_id,
+                    entity.symbol,
+                    assets_by_id,
+                    role="text entity",
+                )
+                item_date = item.available_at.astimezone(calendar.timezone).date()
+                if asset.active_from is not None and item_date < asset.active_from:
+                    raise ValueError(f"text entity for {asset.asset_id} predates active_from")
+                if asset.active_to is not None and item_date > asset.active_to:
+                    raise ValueError(f"text entity for {asset.asset_id} is after active_to")
+            normalized.append(
+                item if item.entities else replace(item, entities=link_entities(item, self.assets))
+            )
+        self.items = normalized
+        raw_path = _write_json_once(
+            self.context.paths.interim / "bronze_refs" / "text.json",
+            [*asset_refs, *text_refs],
+        )
+        text_records: list[dict[str, Any]] = []
+        for item in self.items:
+            record = text_item_to_record(item)
+            record["date"] = item.available_at.date().isoformat()
+            text_records.append(record)
+        text_paths = write_partitioned_parquet(
+            text_records,
+            self.context.paths.interim / "silver" / "text",
+            partition_fields=("source", "date"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        self.outputs.update(
+            {
+                "raw_text_manifest": raw_path,
+                "text": [str(path) for path in text_paths],
+            }
+        )
+
+    def _calendar(self) -> USEquityCalendar:
+        dates = [bar.ts.date() for bar in self.bars]
+        dates.extend(item.available_at.date() for item in self.items)
+        if not dates:
+            today = self.context.created_at.date()
+            dates = [today]
+        return USEquityCalendar(
+            calendar_name=self.config.data.calendar,
+            start=min(dates) - timedelta(days=14),
+            end=max(dates) + timedelta(days=14),
+        )
+
+    def _transformer_results(self) -> dict[str, tuple[float, str, float]]:
+        if not self.enable_transformer_sentiment:
+            return {}
+        transformer = self.config.transformer
+        if not transformer.model_name:
+            raise ValueError(
+                "transformer sentiment was enabled but transformer.model_name is not configured"
+            )
+        engine = CachedTransformerSentiment(
+            TransformerSentimentConfig(
+                model_name=transformer.model_name,
+                model_version=transformer.model_version,
+                cache_dir=self.config.paths.models_dir / "_cache" / "transformer",
+                batch_size=transformer.batch_size,
+                max_sequence_length=transformer.max_sequence_length,
+                local_files_only=transformer.local_files_only,
+            )
+        )
+        values = [f"{item.title or ''}\n{item.body or ''}" for item in self.items]
+        results = engine.predict(values)
+        return {
+            item.item_id: (result.score, result.label, result.confidence)
+            for item, result in zip(self.items, results, strict=True)
+        }
+
+    def build_features(self) -> None:
+        calendar = self._calendar()
+        transformer_results = self._transformer_results()
+        raw_signals = build_text_signals(self.items, self.assets)
+        self.signals = []
+        for signal in raw_signals:
+            decision_time = calendar.next_decision_time(signal.asof_ts)
+            transformer_result = transformer_results.get(signal.item_id)
+            overrides: dict[str, Any] = {"asof_ts": decision_time}
+            if transformer_result is not None:
+                score, label, confidence = transformer_result
+                overrides.update(
+                    {
+                        "sentiment_score": score,
+                        "sentiment_label": label,
+                        "sentiment_confidence": confidence,
+                        "model_version": self.config.transformer.model_version,
+                    }
+                )
+            self.signals.append(replace(signal, **overrides))
+        feature_context = build_feature_rows(
+            self.bars,
+            self.signals,
+            self.config,
+            self.assets,
+            fundamentals=self.fundamentals,
+            earnings_events=self.earnings_events,
+            corporate_actions=self.corporate_actions,
+        )
+        self.features = [
+            row for row in feature_context if self._is_decision_timestamp(str(row["asof_ts"]))
+        ]
+        for row in self.features:
+            row["beta"] = row.get("market_beta_60d")
+            row["volatility"] = row.get("realized_volatility_20d")
+            row.update(conservative_risk_estimates(row, self.config.backtest))
+            row["short_available"] = False
+            row["hard_to_borrow"] = False
+        signal_records: list[dict[str, Any]] = []
+        for signal in self.signals:
+            record = _signal_to_record(signal)
+            record["year"] = signal.asof_ts.year
+            signal_records.append(record)
+        signal_paths = write_partitioned_parquet(
+            signal_records,
+            self.context.paths.processed / "silver" / "text_signals",
+            partition_fields=("symbol", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        store = ParquetFeatureStore(
+            self.context.paths.processed / "gold" / "features",
+            compression=self.config.data.compression,
+        )
+        store.write_features(self.features)
+        self.outputs.update(
+            {
+                "signals": [str(path) for path in signal_paths],
+                "features": str(self.context.paths.processed / "gold" / "features"),
+            }
+        )
+
+    def build_labels(self) -> None:
+        label_context = build_label_rows(self.bars, self.config, self.assets)
+        self.labels = [
+            row for row in label_context if self._is_decision_timestamp(str(row["asof_ts"]))
+        ]
+        records: list[dict[str, Any]] = []
+        for row in self.labels:
+            record = dict(row)
+            record["year"] = parse_utc(str(row["asof_ts"])).year
+            records.append(record)
+        paths = write_partitioned_parquet(
+            records,
+            self.context.paths.processed / "gold" / "labels",
+            partition_fields=("label_version", "year"),
+            compression=self.config.data.compression,
+            max_rows_per_file=self.config.data.write_batch_rows,
+        )
+        self.outputs["labels"] = [str(path) for path in paths]
+
+    def train(self) -> None:
+        self.model = train_baselines(
+            self.features,
+            self.labels,
+            model_version=self.config.features.model_version,
+            min_train_rows=self.config.models.min_train_rows,
+            embargo_periods=self.config.models.embargo_periods,
+        )
+        registry = LocalModelRegistry(self.context.paths.models)
+        path = registry.save_model(
+            self.config.features.model_version,
+            self.model,
+            metadata={
+                "run_id": self.context.run_id,
+                "config_hash": self.config.content_hash(),
+                "training_protocol": self.model["training_protocol"],
+            },
+        )
+        self.outputs["model"] = path
+
+    def predict(self) -> None:
+        self.predictions = predict_all_families(self.features, self.model)
+        prediction_paths: list[str] = []
+        for _family, rows in sorted(self.predictions.items()):
+            records: list[dict[str, Any]] = []
+            for row in rows:
+                record = dict(row)
+                record["year"] = parse_utc(str(row["asof_ts"])).year
+                records.append(record)
+            paths = write_partitioned_parquet(
+                records,
+                self.context.paths.processed / "gold" / "predictions",
+                partition_fields=("model_family", "year"),
+                compression=self.config.data.compression,
+                max_rows_per_file=self.config.data.write_batch_rows,
+            )
+            prediction_paths.extend(str(path) for path in paths)
+        self.evaluation = evaluate_predictions(
+            self.predictions,
+            self.labels,
+            context_rows=self.features,
+            top_k=self.config.models.top_k,
+        )
+        registry = LocalModelRegistry(self.context.paths.models)
+        registry.record_metrics(self.config.features.model_version, self.evaluation)
+        self.outputs["predictions"] = prediction_paths
+        self.outputs["model_evaluation"] = _write_json_once(
+            self.context.paths.processed / "evaluation" / "prediction_metrics.json",
+            self.evaluation,
+        )
+
+    def backtest(self) -> None:
+        engine = DeterministicBacktestEngine()
+        for family, rows in sorted(self.predictions.items()):
+            result = engine.run(rows, self.labels, self.config.backtest)
+            self.backtests[family] = result
+            _write_json_once(
+                self.context.paths.processed / "backtests" / family / "backtest.json",
+                result,
+            )
+        comparison = {
+            family: result["metrics"] for family, result in sorted(self.backtests.items())
+        }
+        self.outputs["backtests"] = str(self.context.paths.processed / "backtests")
+        self.outputs["backtest_comparison"] = _write_json_once(
+            self.context.paths.processed / "evaluation" / "backtest_comparison.json",
+            comparison,
+        )
+
+    def paper(self) -> None:
+        rows = self.predictions.get("combined", [])
+        if not rows:
+            raise ValueError("paper simulation requires combined-model predictions")
+        latest_ts = max(str(row["asof_ts"]) for row in rows)
+        latest = [row for row in rows if str(row["asof_ts"]) == latest_ts]
+        intended_execution_ts = format_utc(
+            self._calendar().next_open_decision_time(
+                parse_utc(latest_ts) + timedelta(microseconds=1)
+            )
+        )
+        ranked = sorted(latest, key=lambda row: float(row["score"]), reverse=True)
+        selected = [row for row in ranked if float(row["score"]) > 0][: self.config.models.top_k]
+        desired = {
+            str(row["asset_id"]): self.config.backtest.max_position_weight for row in selected
+        }
+        decision = constrain_target_weights(
+            desired,
+            latest,
+            {},
+            constraints_from_config(self.config.backtest),
+            equity=self.config.backtest.initial_capital,
+        )
+        intents = [
+            PaperOrderIntent(
+                strategy_id="combined-research-paper",
+                asof_ts=intended_execution_ts,
+                asset_id=str(row["asset_id"]),
+                symbol=str(row["symbol"]),
+                target_weight=decision.target_weights.get(str(row["asset_id"]), 0.0),
+                side="BUY"
+                if decision.target_weights.get(str(row["asset_id"]), 0.0) > 0
+                else "FLAT",
+                reason_codes=("combined_score_positive",)
+                if str(row["asset_id"]) in desired
+                else ("not_selected",),
+            )
+            for row in latest
+        ]
+        rows_by_asset = {str(row["asset_id"]): row for row in latest}
+        snapshot = {
+            "simulation_only": True,
+            "status": "pending_unfilled_intents",
+            "decision_ts": latest_ts,
+            "intended_execution_ts": intended_execution_ts,
+            "initial_capital": self.config.backtest.initial_capital,
+            "equity": self.config.backtest.initial_capital,
+            "positions": {},
+            "trades": [],
+            "intents": [
+                {
+                    "strategy_id": intent.strategy_id,
+                    "decision_ts": latest_ts,
+                    "intended_execution_ts": intent.asof_ts,
+                    "asset_id": intent.asset_id,
+                    "symbol": intent.symbol,
+                    "target_weight": intent.target_weight,
+                    "side": intent.side,
+                    "reason_codes": list(intent.reason_codes),
+                    "risk_flags": sorted(
+                        set(decision.rejected.get(intent.asset_id, ()))
+                        | set(risk_estimate_flags(rows_by_asset.get(intent.asset_id, {})))
+                    ),
+                    "decision_liquidity_proxy_dollar_volume": rows_by_asset.get(
+                        intent.asset_id, {}
+                    ).get("dollar_volume"),
+                }
+                for intent in intents
+            ],
+            "portfolio_risk_flags": sorted(
+                set(decision.risk_flags)
+                | {
+                    flag
+                    for row in latest
+                    if str(row["asset_id"]) in decision.target_weights
+                    for flag in risk_estimate_flags(row)
+                }
+            ),
+            "execution_note": "simulation-only next-session-open intent; no broker order, "
+            "fill, cost, cash, or position mutation has occurred",
+        }
+        self.outputs["paper"] = _write_json_once(
+            self.context.paths.processed / "paper" / "snapshot.json",
+            snapshot,
+        )
+
+    def report(self) -> None:
+        primary = self.backtests.get("combined")
+        if primary is None:
+            raise ValueError("reporting requires a combined-model backtest")
+        evaluation = {
+            "prediction": self.evaluation,
+            "portfolio": {
+                family: result["metrics"] for family, result in sorted(self.backtests.items())
+            },
+        }
+        path = write_report(
+            self.config,
+            primary,
+            self.context.paths.reports / "research_note.md",
+            report_run_id=self.context.run_id,
+            created_at=self.context.created_at,
+            code_version=self.context.code,
+            data_manifest=list(self.context.inputs),
+            universe=[asset.symbol for asset in self.assets],
+            period=self.period(),
+            model_evaluation=evaluation,
+            known_limitations=self.limitations(),
+            next_questions=self.next_questions(),
+        )
+        self.outputs["report"] = path
+
+    def period(self) -> dict[str, str | None]:
+        decision_bars = self._decision_bars()
+        if not decision_bars:
+            return {"start": None, "end": None}
+        timestamps = [bar.ts for bar in decision_bars]
+        return {"start": format_utc(min(timestamps)), "end": format_utc(max(timestamps))}
+
+    def limitations(self) -> list[str]:
+        values = list(DEFAULT_LIMITATIONS)
+        if not self.enable_transformer_sentiment:
+            values.append("Text sentiment uses a deterministic finance dictionary baseline.")
+        if self.config.mode == "sample":
+            values.append("No sample metric is evidence of investment profitability.")
+        return values
+
+    @staticmethod
+    def next_questions() -> list[str]:
+        return [
+            "Validate with licensed point-in-time data and a survivorship-aware universe.",
+            "Test stability by sector, liquidity, volatility regime, source, and event type.",
+            "Calibrate capacity and execution assumptions against user-provided quote or fill "
+            "data.",
+        ]
+
+    def final_metrics(self) -> dict[str, Any]:
+        if self.backtests:
+            return {
+                "prediction": self.evaluation,
+                "portfolio": {
+                    family: result["metrics"] for family, result in sorted(self.backtests.items())
+                },
+            }
+        return {
+            "assets": len(self.assets),
+            "bars": len(self._decision_bars()),
+            "text_items": len(self.items),
+            "features": len(self.features),
+            "labels": len(self.labels),
+        }
+
+
+def validate(config: ResearchConfig) -> dict[str, Any]:
+    errors = validate_config(config)
+    return {"ok": not errors, "errors": errors}
+
+
+def run_to_stage(
+    config: ResearchConfig,
+    stage: str,
+) -> dict[str, Any]:
+    target = "report" if stage == "smoke" else stage.replace("-", "_")
+    if target not in DEPENDENCIES:
+        raise ValueError(f"unknown pipeline stage: {stage}")
+    errors = validate_config(config)
+    if errors:
+        raise ValueError("; ".join(errors))
+    context = create_run_context(config)
+    LOGGER.info(
+        "run_start run_id=%s target=%s mode=%s",
+        context.run_id,
+        target,
+        config.mode,
+    )
+    execution = PipelineExecution(
+        config,
+        context,
+    )
+    try:
+        execution.run(target)
+        final_manifest = finalize_run(
+            context,
+            universe=[asset.symbol for asset in execution.assets],
+            period=execution.period(),
+            metrics=execution.final_metrics(),
+            known_limitations=execution.limitations(),
+            next_questions=execution.next_questions(),
+            stage=target,
+        )
+        execution.outputs["final_manifest"] = final_manifest
+        LOGGER.info("run_complete run_id=%s target=%s", context.run_id, target)
+        return execution.outputs
+    except Exception as error:
+        LOGGER.exception("run_failed run_id=%s target=%s", context.run_id, target)
+        fail_run(context, error, stage=target)
+        raise
+
+
+def ingest_market(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "ingest_market")
+
+
+def ingest_text(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "ingest_text")
+
+
+def build_features(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "build_features")
+
+
+def build_labels(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "build_labels")
+
+
+def train(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "train")
+
+
+def predict(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "predict")
+
+
+def backtest(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "backtest")
+
+
+def paper(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "paper")
+
+
+def report(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "report")
+
+
+def smoke(config: ResearchConfig) -> dict[str, Any]:
+    return run_to_stage(config, "smoke")
