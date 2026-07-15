@@ -67,7 +67,7 @@ def _decision_round(
         decision_time=decision_time,
         horizon_days=5,
         model=ModelIdentity(
-            provider="transformers_causal_lm",
+            provider="llama_cpp_gguf",
             model_id="local/test-model",
             revision="immutable-revision-1",
             sha256="b" * 64,

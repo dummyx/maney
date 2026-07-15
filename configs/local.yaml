@@ -74,19 +74,22 @@ transformer:
 llm_annotations:
   enabled: false
   feature_mode: sidecar
-  backend: transformers_causal_lm
-  model_id: null
-  model_revision: null
-  model_license_or_terms_ref: null
+  backend: llama_cpp_gguf
+  model_id: unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL
+  model_revision: 5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
+  model_license_or_terms_ref: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/tree/5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf
   prompt_version: semantic-evidence-v2
   schema_version: semantic-signal-v2
   verifier_version: semantic-evidence-verifier-v1
   batch_size: 1
   max_input_tokens: 2048
   max_new_tokens: 384
+  context_tokens: 8192
+  prompt_batch_tokens: 512
+  gpu_layers: -1
+  flash_attention: true
+  use_mmap: true
   decoding: greedy
   seed: 7
   input_cost_per_million_tokens_usd: null
   output_cost_per_million_tokens_usd: null
-  local_files_only: true
-  trust_remote_code: false

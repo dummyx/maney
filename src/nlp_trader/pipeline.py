@@ -799,12 +799,15 @@ class PipelineExecution:
                 batch_size=configured.batch_size,
                 max_input_tokens=configured.max_input_tokens,
                 max_new_tokens=configured.max_new_tokens,
+                context_tokens=configured.context_tokens,
+                prompt_batch_tokens=configured.prompt_batch_tokens,
+                gpu_layers=configured.gpu_layers,
+                flash_attention=configured.flash_attention,
+                use_mmap=configured.use_mmap,
                 decoding=configured.decoding,
                 seed=configured.seed,
                 input_cost_per_million_tokens_usd=(configured.input_cost_per_million_tokens_usd),
                 output_cost_per_million_tokens_usd=(configured.output_cost_per_million_tokens_usd),
-                local_files_only=configured.local_files_only,
-                trust_remote_code=configured.trust_remote_code,
             ),
             generator=self.llm_generator,
         )
@@ -814,7 +817,7 @@ class PipelineExecution:
         )
         if model_manifest is None or not model_manifest.get("sha256"):
             raise ValueError("run input manifest is missing the enabled local LLM model hash")
-        loaded_model_hash = annotator.provenance_payload.get("model_directory_sha256")
+        loaded_model_hash = annotator.provenance_payload.get("model_file_sha256")
         if loaded_model_hash != model_manifest["sha256"]:
             raise ValueError("configured local LLM model changed after run input capture")
         assets_by_id = self._assets_by_id()
@@ -894,7 +897,7 @@ class PipelineExecution:
         provenance.update(
             {
                 "run_id": self.context.run_id,
-                "model_directory_sha256": model_manifest["sha256"],
+                "model_file_sha256": model_manifest["sha256"],
                 "model_license_or_terms_ref": configured.model_license_or_terms_ref,
                 "feature_mode": configured.feature_mode,
                 "retrospective_parser": True,
@@ -974,7 +977,7 @@ class PipelineExecution:
                         "schema_version": configured.schema_version,
                         "verifier_version": configured.verifier_version,
                         "verification_valid": verification.valid,
-                        "model_directory_sha256": model_manifest["sha256"],
+                        "model_file_sha256": model_manifest["sha256"],
                         "retrospective_parser": True,
                         "year": item.available_at.year,
                     }
@@ -1175,7 +1178,7 @@ class PipelineExecution:
             "prompt_version": configured.prompt_version,
             "schema_version": configured.schema_version,
             "verifier_version": configured.verifier_version,
-            "model_directory_sha256": model_manifest["sha256"],
+            "model_file_sha256": model_manifest["sha256"],
         }
         summary_path = _write_json_once(
             self.context.paths.processed / "evaluation" / "llm_annotation_summary.json",

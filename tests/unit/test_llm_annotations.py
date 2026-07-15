@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,9 +46,8 @@ def _candidates() -> tuple[AssetCandidate, ...]:
 
 
 def _config(tmp_path: Path, *, batch_size: int = 2) -> LLMAnnotationConfig:
-    model_path = tmp_path / "model"
-    model_path.mkdir(exist_ok=True)
-    (model_path / "config.json").write_text("{}\n", encoding="utf-8")
+    model_path = tmp_path / "model.gguf"
+    model_path.write_bytes(b"tiny synthetic GGUF fixture\n")
     return LLMAnnotationConfig(
         model_path=model_path,
         model_id="test-causal-lm",
@@ -95,6 +96,90 @@ def _valid_payload() -> dict[str, object]:
             },
         ]
     }
+
+
+def _fake_llama_cpp_module(
+    *,
+    completion: dict[str, object] | None = None,
+    completion_error: str | None = None,
+    supports_gpu_offload: bool = True,
+    metal_context_failure: bool = False,
+) -> tuple[object, dict[str, list[object]], str]:
+    calls: dict[str, list[object]] = {"init": [], "tokenize": [], "chat": []}
+    chat_template = (
+        "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        "{% if add_generation_prompt %}assistant:{% endif %}"
+    )
+    resolved_completion = completion or {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": json.dumps(_valid_payload())},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 101, "completion_tokens": 47, "total_tokens": 148},
+    }
+
+    class FakeLlama:
+        def __init__(self, **kwargs: object) -> None:
+            calls["init"].append(dict(kwargs))
+            if metal_context_failure and kwargs.get("n_gpu_layers") != 0:
+                raise ValueError("Failed to create llama_context")
+            self.metadata = {"tokenizer.chat_template": chat_template}
+
+        @staticmethod
+        def token_eos() -> int:
+            return 2
+
+        @staticmethod
+        def token_bos() -> int:
+            return 1
+
+        @staticmethod
+        def detokenize(tokens: list[int], *, special: bool) -> bytes:
+            assert special is True
+            return b"</s>" if tokens == [2] else b"<s>"
+
+        def tokenize(
+            self,
+            text: bytes,
+            *,
+            add_bos: bool,
+            special: bool,
+        ) -> list[int]:
+            calls["tokenize"].append((text, add_bos, special))
+            return list(range(101))
+
+        def create_chat_completion(self, **kwargs: object) -> dict[str, object]:
+            calls["chat"].append(dict(kwargs))
+            if completion_error is not None:
+                raise ValueError(completion_error)
+            return resolved_completion
+
+    class FakeChatFormatter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def __call__(*, messages: list[dict[str, str]]) -> SimpleNamespace:
+            return SimpleNamespace(
+                prompt=messages[0]["content"] + "assistant:",
+                added_special=True,
+            )
+
+    native = SimpleNamespace(
+        llama_supports_gpu_offload=lambda: supports_gpu_offload,
+    )
+    chat_format_module = SimpleNamespace(Jinja2ChatFormatter=FakeChatFormatter)
+    return (
+        SimpleNamespace(
+            llama_cpp=native,
+            llama_chat_format=chat_format_module,
+            Llama=FakeLlama,
+        ),
+        calls,
+        chat_template,
+    )
 
 
 def test_request_contains_only_current_source_evidence_and_canonical_candidates() -> None:
@@ -460,31 +545,13 @@ def test_batch_rounds_record_full_latency_while_summary_counts_wall_time_once(
     ] == pytest.approx([2.0, 2.0])
 
 
-def test_effective_generated_tokens_exclude_batch_padding() -> None:
-    assert llm_module._effective_generated_tokens(
-        [8, 2, 0, 0],
-        eos_ids={2},
-        pad_token_id=0,
-    ) == ([8, 2], True)
-    assert llm_module._effective_generated_tokens(
-        [8, 9, 10],
-        eos_ids={2},
-        pad_token_id=0,
-    ) == ([8, 9, 10], False)
-    assert llm_module._effective_generated_tokens(
-        [8, 0, 0],
-        eos_ids={2},
-        pad_token_id=0,
-    ) == ([8], True)
-
-
 def test_cache_identity_changes_with_exact_model_bytes_and_schema(tmp_path: Path) -> None:
     request = build_annotation_request(_item(), _candidates())
     config = _config(tmp_path)
     first = CachedLocalLLMAnnotator(config, generator=lambda _values: [])
     first_key = first.cache_key_for(request)
 
-    (config.model_path / "config.json").write_text('{"changed":true}\n', encoding="utf-8")
+    config.model_path.write_bytes(b"changed synthetic GGUF fixture\n")
     changed_model = CachedLocalLLMAnnotator(config, generator=lambda _values: [])
     assert changed_model.cache_key_for(request) != first_key
 
@@ -496,127 +563,179 @@ def test_cache_identity_changes_with_exact_model_bytes_and_schema(tmp_path: Path
     assert changed_schema.cache_key_for(request) != changed_model.cache_key_for(request)
 
 
-def test_default_backend_loads_local_causal_lm_lazily_and_generates_strict_json(
+def test_llama_cpp_adapter_contract_uses_expected_call_shape_and_usage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loads: list[tuple[str, str, dict[str, object]]] = []
-
-    class FakeTensor:
-        def __init__(self, values: list[int] | list[list[int]]) -> None:
-            self.values = values
-
-        @property
-        def shape(self) -> tuple[int, int]:
-            assert self.values and isinstance(self.values[0], list)
-            rows = self.values
-            return (len(rows), len(rows[0]))
-
-        def __getitem__(self, index: slice) -> FakeTensor:
-            assert self.values and isinstance(self.values[0], int)
-            values = self.values
-            return FakeTensor(values[index])
-
-        def detach(self) -> FakeTensor:
-            return self
-
-        def cpu(self) -> FakeTensor:
-            return self
-
-        def tolist(self) -> list[int]:
-            assert not self.values or isinstance(self.values[0], int)
-            return list(self.values)
-
-    class FakeBatch(dict[str, FakeTensor]):
-        def to(self, _device: str) -> FakeBatch:
-            return self
-
-    class FakeTokenizer:
-        pad_token_id = 0
-        eos_token_id = 2
-        model_max_length = 1024
-        padding_side = "right"
-
-        @classmethod
-        def from_pretrained(cls, path: str, **kwargs: object) -> FakeTokenizer:
-            loads.append(("tokenizer", path, kwargs))
-            return cls()
-
-        def __call__(self, value: str | list[str], **_kwargs: object) -> object:
-            if isinstance(value, str):
-                return {"input_ids": [1] * 12}
-            return FakeBatch({"input_ids": FakeTensor([[1] * 12 for _ in value])})
-
-        def decode(self, _values: FakeTensor, **_kwargs: object) -> str:
-            return json.dumps(_valid_payload())
-
-    class FakeModel:
-        class Config:
-            max_position_embeddings = 1024
-
-        config = Config()
-        device: str | None = None
-        evaluated = False
-
-        @classmethod
-        def from_pretrained(cls, path: str, **kwargs: object) -> FakeModel:
-            loads.append(("model", path, kwargs))
-            return cls()
-
-        def to(self, device: str) -> None:
-            self.device = device
-
-        def eval(self) -> None:
-            self.evaluated = True
-
-        def generate(self, **kwargs: object) -> list[FakeTensor]:
-            input_ids = kwargs["input_ids"]
-            assert isinstance(input_ids, FakeTensor)
-            width = input_ids.shape[1]
-            return [FakeTensor([1] * width + [9, 2])]
-
-    class InferenceMode:
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-    class FakeTorch:
-        seed: int | None = None
-
-        @classmethod
-        def manual_seed(cls, seed: int) -> None:
-            cls.seed = seed
-
-        @staticmethod
-        def inference_mode() -> InferenceMode:
-            return InferenceMode()
-
-    class FakeTransformers:
-        AutoTokenizer = FakeTokenizer
-        AutoModelForCausalLM = FakeModel
+    fake_module, calls, chat_template = _fake_llama_cpp_module()
 
     def fake_import(name: str) -> object:
-        if name == "transformers":
-            return FakeTransformers
-        if name == "torch":
-            return FakeTorch
-        raise ImportError(name)
+        assert name == "llama_cpp"
+        return fake_module
 
     monkeypatch.setattr(llm_module, "import_module", fake_import)
-    monkeypatch.setattr(llm_module, "get_torch_device", lambda: "cpu")
+    monkeypatch.setattr(
+        llm_module, "version", lambda name: "0.test" if name == "llama-cpp-python" else ""
+    )
     config = _config(tmp_path)
-    response = CachedLocalLLMAnnotator(config).annotate(
-        [build_annotation_request(_item(), _candidates())]
-    )[0]
+    request = build_annotation_request(_item(), _candidates())
+    engine = CachedLocalLLMAnnotator(config)
+
+    response = engine.annotate([request])[0]
 
     assert [annotation.stance_label for annotation in response.annotations] == [
         "positive",
         "negative",
     ]
-    assert FakeTorch.seed == config.seed
-    assert [kind for kind, _, _ in loads] == ["tokenizer", "model"]
-    assert all(
-        kwargs == {"local_files_only": True, "trust_remote_code": False} for _, _, kwargs in loads
+    assert calls["init"] == [
+        {
+            "model_path": str(config.model_path),
+            "n_ctx": config.context_tokens,
+            "n_batch": config.prompt_batch_tokens,
+            "n_gpu_layers": config.gpu_layers,
+            "seed": config.seed,
+            "flash_attn": config.flash_attention,
+            "use_mmap": config.use_mmap,
+            "offload_kqv": True,
+            "op_offload": True,
+            "chat_format": "chat_template.default",
+            "verbose": False,
+        }
+    ]
+    assert calls["tokenize"] == [((request.prompt + "assistant:").encode("utf-8"), False, True)]
+    assert calls["chat"] == [
+        {
+            "messages": [{"role": "user", "content": request.prompt}],
+            "response_format": {"type": "json_object", "schema": engine.schema_payload},
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "typical_p": 1.0,
+            "repeat_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "seed": config.seed,
+            "max_tokens": config.max_new_tokens,
+            "stream": False,
+        }
+    ]
+    assert engine.generated_input_token_count == 101
+    assert engine.generated_output_token_count == 47
+    assert engine.provenance_payload == {
+        **engine.provenance_payload,
+        "backend": "llama_cpp_gguf",
+        "generator_mode": "llama_cpp",
+        "llama_cpp_python_version": "0.test",
+        "model_file_sha256": hashlib.sha256(config.model_path.read_bytes()).hexdigest(),
+        "chat_template_source": "embedded_gguf_metadata",
+        "chat_template_sha256": hashlib.sha256(chat_template.encode("utf-8")).hexdigest(),
+        "device": "metal",
+        "effective_gpu_layers": config.gpu_layers,
+        "mtp_speculative_decoding": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("error_message", "expected_abstention"),
+    [
+        ("Requested tokens (8193) exceed context window of 8192", True),
+        ("context not initialized", False),
+        ("model evaluation failed", False),
+    ],
+)
+def test_llama_cpp_adapter_contract_maps_only_context_errors_to_input_too_long(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_message: str,
+    expected_abstention: bool,
+) -> None:
+    fake_module, _, _ = _fake_llama_cpp_module(
+        completion_error=error_message,
+        supports_gpu_offload=False,
     )
+    monkeypatch.setattr(llm_module, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(llm_module, "version", lambda name: "0.test")
+    engine = CachedLocalLLMAnnotator(_config(tmp_path))
+    request = build_annotation_request(_item(), _candidates())
+
+    if not expected_abstention:
+        with pytest.raises(ValueError, match=error_message):
+            engine.annotate([request])
+        return
+
+    response = engine.annotate([request])[0]
+    assert {annotation.stance_label for annotation in response.annotations} == {"abstain"}
+    assert {annotation.abstain_reason for annotation in response.annotations} == {"input_too_long"}
+    assert engine.provenance_payload["device"] == "cpu"
+    assert engine.provenance_payload["effective_gpu_layers"] == 0
+
+
+def test_llama_cpp_generator_does_not_retain_annotator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_module, _, _ = _fake_llama_cpp_module()
+    monkeypatch.setattr(llm_module, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(llm_module, "version", lambda name: "0.test")
+    engine = CachedLocalLLMAnnotator(_config(tmp_path))
+
+    generator = engine._default_generator()
+
+    closure_values = [cell.cell_contents for cell in generator.__closure__ or ()]
+    assert engine not in closure_values
+
+
+def test_llama_cpp_adapter_contract_rejects_length_limited_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completion = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": json.dumps(_valid_payload())},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 101, "completion_tokens": 384, "total_tokens": 485},
+    }
+    fake_module, _, _ = _fake_llama_cpp_module(completion=completion)
+    monkeypatch.setattr(llm_module, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(llm_module, "version", lambda name: "0.test")
+    engine = CachedLocalLLMAnnotator(_config(tmp_path))
+
+    with pytest.raises(ValueError, match="reached max_new_tokens"):
+        engine.annotate([build_annotation_request(_item(), _candidates())])
+
+
+def test_llama_cpp_adapter_contract_reports_metal_context_creation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_module, calls, _ = _fake_llama_cpp_module(metal_context_failure=True)
+    monkeypatch.setattr(llm_module, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(llm_module, "version", lambda name: "0.test")
+    engine = CachedLocalLLMAnnotator(_config(tmp_path))
+
+    with pytest.raises(RuntimeError, match="GGML_METAL=OFF"):
+        engine.annotate([build_annotation_request(_item(), _candidates())])
+
+    assert [call["n_gpu_layers"] for call in calls["init"]] == [-1]
+
+
+def test_llama_cpp_adapter_contract_uses_cpu_only_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_module, calls, _ = _fake_llama_cpp_module(supports_gpu_offload=False)
+    monkeypatch.setattr(llm_module, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(llm_module, "version", lambda name: "0.test")
+    engine = CachedLocalLLMAnnotator(_config(tmp_path))
+
+    engine.annotate([build_annotation_request(_item(), _candidates())])
+
+    assert [call["n_gpu_layers"] for call in calls["init"]] == [0]
+    assert [call["offload_kqv"] for call in calls["init"]] == [False]
+    assert [call["op_offload"] for call in calls["init"]] == [False]
+    assert engine.provenance_payload["device"] == "cpu"
+    assert engine.provenance_payload["effective_gpu_layers"] == 0

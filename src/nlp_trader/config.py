@@ -12,6 +12,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from nlp_trader.timestamps import parse_utc
 
+DEFAULT_LLM_MODEL_ID = "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL"
+DEFAULT_LLM_MODEL_REVISION = "5c641ee6f93ccf8b1f01824455bfdbbdd7d658bf"
+DEFAULT_LLM_MODEL_SHA256 = "4085665ee36d82a672a238a43f0e5643f2f0e39f2d7bd5d373f0ef10ecf53095"
+DEFAULT_LLM_MODEL_LICENSE_OR_TERMS_REF = (
+    "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/tree/" + DEFAULT_LLM_MODEL_REVISION
+)
+
 
 class FrozenModel(BaseModel):
     """Strict immutable configuration base used by every runtime section."""
@@ -203,22 +210,28 @@ class LLMAnnotationsConfig(FrozenModel):
 
     enabled: bool = False
     feature_mode: Literal["sidecar", "augment"] = "sidecar"
-    backend: Literal["transformers_causal_lm"] = "transformers_causal_lm"
-    model_id: str | None = None
-    model_revision: str | None = None
-    model_license_or_terms_ref: str | None = None
+    backend: Literal["llama_cpp_gguf"] = "llama_cpp_gguf"
+    model_id: str = Field(default=DEFAULT_LLM_MODEL_ID, min_length=1)
+    model_revision: str = Field(default=DEFAULT_LLM_MODEL_REVISION, min_length=1)
+    model_license_or_terms_ref: str = Field(
+        default=DEFAULT_LLM_MODEL_LICENSE_OR_TERMS_REF,
+        min_length=1,
+    )
     prompt_version: str = Field(default="semantic-evidence-v2", min_length=1)
     schema_version: str = Field(default="semantic-signal-v2", min_length=1)
     verifier_version: str = Field(default="semantic-evidence-verifier-v1", min_length=1)
     batch_size: int = Field(default=1, ge=1)
     max_input_tokens: int = Field(default=2048, ge=1)
     max_new_tokens: int = Field(default=384, ge=1)
+    context_tokens: int = Field(default=8192, ge=1)
+    prompt_batch_tokens: int = Field(default=512, ge=1)
+    gpu_layers: int = Field(default=-1, ge=-1)
+    flash_attention: bool = True
+    use_mmap: bool = True
     decoding: Literal["greedy"] = "greedy"
-    seed: int = Field(default=7, ge=0)
+    seed: int = Field(default=7, ge=1)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0.0)
     output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0.0)
-    local_files_only: Literal[True] = True
-    trust_remote_code: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_enabled_settings(self) -> LLMAnnotationsConfig:
@@ -228,17 +241,20 @@ class LLMAnnotationsConfig(FrozenModel):
             self.output_cost_per_million_tokens_usd is None
         ):
             raise ValueError("LLM input and output token cost rates must be configured together")
-        if self.enabled:
-            required = {
-                "model_id": self.model_id,
-                "model_revision": self.model_revision,
-                "model_license_or_terms_ref": self.model_license_or_terms_ref,
-            }
-            missing = sorted(
-                name for name, value in required.items() if value is None or not value.strip()
+        required = {
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "model_license_or_terms_ref": self.model_license_or_terms_ref,
+        }
+        blank = sorted(name for name, value in required.items() if not value.strip())
+        if blank:
+            raise ValueError("llm_annotations values must not be blank: " + ", ".join(blank))
+        if self.max_input_tokens + self.max_new_tokens > self.context_tokens:
+            raise ValueError(
+                "llm_annotations.context_tokens must be at least max_input_tokens + max_new_tokens"
             )
-            if missing:
-                raise ValueError("enabled llm_annotations requires: " + ", ".join(missing))
+        if self.prompt_batch_tokens > self.context_tokens:
+            raise ValueError("llm_annotations.prompt_batch_tokens cannot exceed context_tokens")
         return self
 
 
@@ -376,10 +392,10 @@ def validate_config(config: ResearchConfig, *, require_inputs: bool = True) -> l
             model_path = config.paths.llm_model
             if model_path is None:
                 errors.append("missing llm_model: paths.llm_model is not configured")
-            elif not model_path.is_dir():
-                errors.append(f"llm_model must be a local directory: {model_path}")
-            elif not any(candidate.is_file() for candidate in model_path.rglob("*")):
-                errors.append(f"llm_model directory contains no files: {model_path}")
+            elif not model_path.is_file():
+                errors.append(f"llm_model must be an existing local GGUF file: {model_path}")
+            elif model_path.suffix.lower() != ".gguf":
+                errors.append(f"llm_model must have a .gguf extension: {model_path}")
     write_roots = {
         "raw_dir": config.paths.raw_dir,
         "interim_dir": config.paths.interim_dir,

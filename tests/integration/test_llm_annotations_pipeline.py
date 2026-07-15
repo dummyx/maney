@@ -19,10 +19,9 @@ def _enabled_llm_config(
     *,
     feature_mode: str,
 ) -> ResearchConfig:
-    model_dir = tmp_path / "local-llm"
-    model_dir.mkdir(exist_ok=True)
-    (model_dir / "config.json").write_text('{"model_type":"test-only"}\n', encoding="utf-8")
-    paths = config.paths.model_copy(update={"llm_model": model_dir})
+    model_path = tmp_path / "local-llm.gguf"
+    model_path.write_bytes(b"tiny synthetic GGUF fixture\n")
+    paths = config.paths.model_copy(update={"llm_model": model_path})
     annotations = config.llm_annotations.model_copy(
         update={
             "enabled": True,
@@ -108,13 +107,17 @@ def test_disabled_sample_path_has_no_llm_artifacts_or_optional_imports(
     generated_config: ResearchConfig,
 ) -> None:
     optional_before = {
-        module for module in sys.modules if module.split(".", 1)[0] in {"torch", "transformers"}
+        module
+        for module in sys.modules
+        if module.split(".", 1)[0] in {"torch", "transformers", "llama_cpp"}
     }
 
     outputs = build_features(generated_config)
 
     optional_after = {
-        module for module in sys.modules if module.split(".", 1)[0] in {"torch", "transformers"}
+        module
+        for module in sys.modules
+        if module.split(".", 1)[0] in {"torch", "transformers", "llama_cpp"}
     }
     assert optional_after == optional_before
     assert not any(key.startswith("llm_") for key in outputs)
@@ -177,7 +180,8 @@ def test_sidecar_annotations_are_audited_without_changing_signals_and_replay_fro
     annotation_rows = _partition_rows(sidecar_outputs, "llm_annotations")
     assert provenance["retrospective_parser"] is True
     assert provenance["feature_mode"] == "sidecar"
-    assert len(provenance["model_directory_sha256"]) == 64
+    assert provenance["backend"] == "llama_cpp_gguf"
+    assert len(provenance["model_file_sha256"]) == 64
     assert summary["request_count"] == 3
     assert summary["annotation_count"] == 3
     assert summary["feature_mode"] == "sidecar"

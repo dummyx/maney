@@ -9,13 +9,19 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from nlp_trader.config import (
+    DEFAULT_LLM_MODEL_ID,
+    DEFAULT_LLM_MODEL_REVISION,
+    DEFAULT_LLM_MODEL_SHA256,
+)
 from nlp_trader.schemas import TextItem
-from nlp_trader.utils.device import get_torch_device
+from nlp_trader.utils.device import select_llama_cpp_device
 
 type StanceLabel = Literal["positive", "negative", "neutral", "abstain"]
 type EventType = Literal[
@@ -323,12 +329,15 @@ class LLMAnnotationConfig:
     batch_size: int = 1
     max_input_tokens: int = 2048
     max_new_tokens: int = 384
+    context_tokens: int = 8192
+    prompt_batch_tokens: int = 512
+    gpu_layers: int = -1
+    flash_attention: bool = True
+    use_mmap: bool = True
     decoding: Literal["greedy"] = "greedy"
     seed: int = 7
     input_cost_per_million_tokens_usd: float | None = None
     output_cost_per_million_tokens_usd: float | None = None
-    local_files_only: bool = True
-    trust_remote_code: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -341,14 +350,18 @@ class LLMAnnotationConfig:
         ):
             if not getattr(self, field_name).strip():
                 raise ValueError(f"{field_name} must not be empty")
-        if not self.model_path.is_dir():
-            raise ValueError(f"local LLM model directory does not exist: {self.model_path}")
-        if not any(path.is_file() for path in self.model_path.rglob("*")):
-            raise ValueError(f"local LLM model directory contains no files: {self.model_path}")
+        if not self.model_path.is_file() or self.model_path.suffix.lower() != ".gguf":
+            raise ValueError(f"local LLM model must be one existing .gguf file: {self.model_path}")
         if self.batch_size < 1 or self.max_input_tokens < 1 or self.max_new_tokens < 1:
             raise ValueError("LLM batch and token limits must be positive")
-        if self.seed < 0:
-            raise ValueError("LLM seed must be non-negative")
+        if self.context_tokens < self.max_input_tokens + self.max_new_tokens:
+            raise ValueError("LLM context_tokens must cover max_input_tokens + max_new_tokens")
+        if not 1 <= self.prompt_batch_tokens <= self.context_tokens:
+            raise ValueError("LLM prompt_batch_tokens must be within the configured context")
+        if self.gpu_layers < -1:
+            raise ValueError("LLM gpu_layers must be -1, 0, or a positive layer count")
+        if self.seed < 1:
+            raise ValueError("LLM seed must be positive")
         rates = (
             self.input_cost_per_million_tokens_usd,
             self.output_cost_per_million_tokens_usd,
@@ -368,10 +381,6 @@ class LLMAnnotationConfig:
             raise ValueError("LLM token cost rates must be finite and non-negative")
         if self.decoding != "greedy":
             raise ValueError("only deterministic greedy LLM decoding is supported")
-        if not self.local_files_only:
-            raise ValueError("LLM annotations require local_files_only=True")
-        if self.trust_remote_code:
-            raise ValueError("LLM annotations require trust_remote_code=False")
 
 
 def _sha256_text(value: str) -> str:
@@ -397,36 +406,11 @@ def _strict_json_loads(value: str) -> Any:
     )
 
 
-def _effective_generated_tokens(
-    token_ids: list[int],
-    *,
-    eos_ids: set[int],
-    pad_token_id: int | None,
-) -> tuple[list[int], bool]:
-    """Remove batch padding and report whether generation ended normally."""
-
-    effective: list[int] = []
-    for token_id in token_ids:
-        if pad_token_id is not None and token_id == pad_token_id and token_id not in eos_ids:
-            return effective, True
-        effective.append(token_id)
-        if token_id in eos_ids:
-            return effective, True
-    return effective, False
-
-
-def _model_directory_hash(path: Path) -> str:
+def _model_file_hash(path: Path) -> str:
     digest = hashlib.sha256()
-    files = sorted(candidate for candidate in path.rglob("*") if candidate.is_file())
-    for file_path in files:
-        relative = file_path.relative_to(path).as_posix().encode("utf-8")
-        file_digest = hashlib.sha256()
-        with file_path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                file_digest.update(chunk)
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(file_digest.digest())
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -596,7 +580,7 @@ def verify_annotation_response(
 
 
 class CachedLocalLLMAnnotator:
-    """Strict, batched, content-addressed local causal-LM annotation engine."""
+    """Strict, content-addressed local GGUF annotation engine."""
 
     def __init__(
         self,
@@ -607,7 +591,24 @@ class CachedLocalLLMAnnotator:
         self.config = config
         self._injected_generator = generator
         self._loaded_generator: RawGenerator | None = None
-        self._model_directory_sha256 = _model_directory_hash(config.model_path)
+        self._model_file_sha256 = _model_file_hash(config.model_path)
+        if (
+            config.model_id == DEFAULT_LLM_MODEL_ID
+            and config.model_revision == DEFAULT_LLM_MODEL_REVISION
+            and self._model_file_sha256 != DEFAULT_LLM_MODEL_SHA256
+        ):
+            raise ValueError(
+                "default Qwen GGUF SHA-256 mismatch: expected " + DEFAULT_LLM_MODEL_SHA256
+            )
+        self._generator_mode = "injected" if generator is not None else "llama_cpp"
+        try:
+            self._llama_cpp_python_version = (
+                "injected" if generator is not None else version("llama-cpp-python")
+            )
+        except PackageNotFoundError:
+            self._llama_cpp_python_version = "not-installed"
+        self._chat_template_sha256: str | None = None
+        self._effective_gpu_layers: int | None = None
         self._records: dict[str, dict[str, Any]] = {}
         self._device_used = "injected_generator" if generator is not None else "not_loaded"
         self.cache_hit_count = 0
@@ -631,11 +632,16 @@ class CachedLocalLLMAnnotator:
     @property
     def provenance_payload(self) -> dict[str, Any]:
         return {
-            "backend": "transformers_causal_lm",
+            "backend": "llama_cpp_gguf",
+            "generator_mode": self._generator_mode,
+            "llama_cpp_python_version": self._llama_cpp_python_version,
             "model_id": self.config.model_id,
             "model_revision": self.config.model_revision,
             "model_license_or_terms_ref": self.config.model_license_or_terms_ref,
-            "model_directory_sha256": self._model_directory_sha256,
+            "model_file_sha256": self._model_file_sha256,
+            "chat_template_source": "embedded_gguf_metadata",
+            "chat_template_sha256": self._chat_template_sha256,
+            "chat_format": "chat_template.default",
             "prompt_version": self.config.prompt_version,
             "prompt_sha256": _sha256_text(PROMPT_TEXT),
             "schema_version": self.config.schema_version,
@@ -645,15 +651,20 @@ class CachedLocalLLMAnnotator:
             "batch_size": self.config.batch_size,
             "max_input_tokens": self.config.max_input_tokens,
             "max_new_tokens": self.config.max_new_tokens,
+            "context_tokens": self.config.context_tokens,
+            "prompt_batch_tokens": self.config.prompt_batch_tokens,
+            "requested_gpu_layers": self.config.gpu_layers,
+            "effective_gpu_layers": self._effective_gpu_layers,
+            "flash_attention": self.config.flash_attention,
+            "use_mmap": self.config.use_mmap,
             "decoding": self.config.decoding,
             "seed": self.config.seed,
             "verifier_version": self.config.verifier_version,
             "input_cost_per_million_tokens_usd": (self.config.input_cost_per_million_tokens_usd),
             "output_cost_per_million_tokens_usd": (self.config.output_cost_per_million_tokens_usd),
-            "local_files_only": self.config.local_files_only,
-            "trust_remote_code": self.config.trust_remote_code,
             "device": self._device_used,
-            "device_policy": "MPS when available, otherwise CPU",
+            "device_policy": "Metal offload when supported by the binding, otherwise CPU",
+            "mtp_speculative_decoding": False,
         }
 
     def _identity_payload(self, request: AnnotationRequest) -> dict[str, Any]:
@@ -661,7 +672,7 @@ class CachedLocalLLMAnnotator:
             "source_text_hash": request.source_text_hash,
             "request_prompt_sha256": _sha256_text(request.prompt),
             "candidates": [candidate.to_dict() for candidate in request.candidates],
-            "model_directory_sha256": self._model_directory_sha256,
+            "model_file_sha256": self._model_file_sha256,
             "model_id": self.config.model_id,
             "model_revision": self.config.model_revision,
             "prompt_version": self.config.prompt_version,
@@ -670,12 +681,19 @@ class CachedLocalLLMAnnotator:
             "schema_sha256": _sha256_text(
                 json.dumps(self.schema_payload, sort_keys=True, separators=(",", ":"))
             ),
-            "backend": "transformers_causal_lm",
+            "backend": "llama_cpp_gguf",
+            "generator_mode": self._generator_mode,
+            "llama_cpp_python_version": self._llama_cpp_python_version,
             "decoding": self.config.decoding,
             "seed": self.config.seed,
             "batch_size": self.config.batch_size,
             "max_input_tokens": self.config.max_input_tokens,
             "max_new_tokens": self.config.max_new_tokens,
+            "context_tokens": self.config.context_tokens,
+            "prompt_batch_tokens": self.config.prompt_batch_tokens,
+            "gpu_layers": self.config.gpu_layers,
+            "flash_attention": self.config.flash_attention,
+            "use_mmap": self.config.use_mmap,
         }
 
     def _estimated_cost(self, response: GenerationResponse) -> float | None:
@@ -803,7 +821,7 @@ class CachedLocalLLMAnnotator:
         }
         if set(record) != expected_record_fields:
             raise ValueError(f"LLM annotation cache fields mismatch: {path}")
-        if record.get("cache_schema_version") != "llm-semantic-signal-cache-v2":
+        if record.get("cache_schema_version") != "llm-semantic-signal-cache-v3":
             raise ValueError(f"LLM annotation cache schema mismatch: {path}")
         if record.get("identity") != self._identity_payload(request):
             raise ValueError(f"LLM annotation cache request mismatch: {path}")
@@ -849,9 +867,14 @@ class CachedLocalLLMAnnotator:
         current_provenance = self.provenance_payload
         stable_provenance_fields = (
             "backend",
+            "generator_mode",
+            "llama_cpp_python_version",
             "model_id",
             "model_revision",
-            "model_directory_sha256",
+            "model_license_or_terms_ref",
+            "model_file_sha256",
+            "chat_template_source",
+            "chat_format",
             "prompt_version",
             "prompt_sha256",
             "schema_version",
@@ -859,17 +882,40 @@ class CachedLocalLLMAnnotator:
             "batch_size",
             "max_input_tokens",
             "max_new_tokens",
+            "context_tokens",
+            "prompt_batch_tokens",
+            "requested_gpu_layers",
+            "flash_attention",
+            "use_mmap",
             "decoding",
             "seed",
             "verifier_version",
-            "local_files_only",
-            "trust_remote_code",
+            "device_policy",
+            "mtp_speculative_decoding",
         )
         if any(
             provenance_record.get(field_name) != current_provenance[field_name]
             for field_name in stable_provenance_fields
         ):
             raise ValueError(f"LLM annotation cache provenance mismatch: {path}")
+        cached_template_hash = provenance_record.get("chat_template_sha256")
+        valid_template_hash = (
+            cached_template_hash is None
+            if self._generator_mode == "injected"
+            else isinstance(cached_template_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", cached_template_hash) is not None
+        )
+        if not valid_template_hash:
+            raise ValueError(f"invalid LLM annotation cache chat template hash: {path}")
+        cached_device = provenance_record.get("device")
+        cached_gpu_layers = provenance_record.get("effective_gpu_layers")
+        if cached_device not in {"metal", "cpu", "injected_generator"} or (
+            cached_gpu_layers is not None and type(cached_gpu_layers) is not int
+        ):
+            raise ValueError(f"invalid LLM annotation cache device provenance: {path}")
+        self._chat_template_sha256 = cast(str | None, cached_template_hash)
+        self._device_used = cached_device
+        self._effective_gpu_layers = cached_gpu_layers
         input_rate = provenance_record.get("input_cost_per_million_tokens_usd")
         output_rate = provenance_record.get("output_cost_per_million_tokens_usd")
         rates = (input_rate, output_rate)
@@ -983,7 +1029,7 @@ class CachedLocalLLMAnnotator:
     ) -> dict[str, Any]:
         verification = self.verification_for(request, response)
         return {
-            "cache_schema_version": "llm-semantic-signal-cache-v2",
+            "cache_schema_version": "llm-semantic-signal-cache-v3",
             "cache_key": key,
             "identity": self._identity_payload(request),
             "request": {
@@ -1037,120 +1083,192 @@ class CachedLocalLLMAnnotator:
 
     def _default_generator(self) -> RawGenerator:
         try:
-            transformers = import_module("transformers")
-            torch = import_module("torch")
+            llama_cpp = import_module("llama_cpp")
         except ImportError as exc:  # pragma: no cover - optional dependency path
             raise RuntimeError(
-                "Generative LLM annotations are optional; run `uv sync --extra nlp` first"
+                "Generative LLM annotations require llama-cpp-python; "
+                "run `uv sync --extra llm` first"
             ) from exc
 
-        if _model_directory_hash(self.config.model_path) != self._model_directory_sha256:
+        if _model_file_hash(self.config.model_path) != self._model_file_sha256:
             raise ValueError("local LLM model changed before model loading")
-        tokenizer: Any = transformers.AutoTokenizer.from_pretrained(
-            str(self.config.model_path),
-            local_files_only=True,
-            trust_remote_code=False,
+        placement = select_llama_cpp_device(llama_cpp, self.config.gpu_layers)
+        self._device_used = placement.name
+        self._effective_gpu_layers = placement.gpu_layers
+        llama_type = getattr(llama_cpp, "Llama", None)
+        if llama_type is None:
+            raise RuntimeError("installed llama-cpp-python does not expose llama_cpp.Llama")
+        load_options = dict(
+            model_path=str(self.config.model_path),
+            n_ctx=self.config.context_tokens,
+            n_batch=self.config.prompt_batch_tokens,
+            n_gpu_layers=placement.gpu_layers,
+            seed=self.config.seed,
+            flash_attn=self.config.flash_attention,
+            use_mmap=self.config.use_mmap,
+            offload_kqv=placement.name == "metal",
+            op_offload=placement.name == "metal",
+            chat_format="chat_template.default",
+            verbose=False,
         )
-        model: Any = transformers.AutoModelForCausalLM.from_pretrained(
-            str(self.config.model_path),
-            local_files_only=True,
-            trust_remote_code=False,
-        )
-        if _model_directory_hash(self.config.model_path) != self._model_directory_sha256:
+        try:
+            model: Any = llama_type(**load_options)
+        except ValueError as exc:
+            if placement.name == "metal" and "Failed to create llama_context" in str(exc):
+                raise RuntimeError(
+                    "llama.cpp could not create a Metal context; check available unified "
+                    "memory and context settings, or reinstall llama-cpp-python with "
+                    "GGML_METAL=OFF for a CPU-only runtime"
+                ) from exc
+            raise
+        if _model_file_hash(self.config.model_path) != self._model_file_sha256:
             raise ValueError("local LLM model changed while model files were loading")
-        if tokenizer.pad_token_id is None:
-            if tokenizer.eos_token_id is None:
-                raise ValueError("local causal-LM tokenizer requires a pad or EOS token")
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-        device = get_torch_device()
-        self._device_used = str(device)
-        model.to(device)
-        model.eval()
-        torch.manual_seed(self.config.seed)
-        context_limits: list[int] = []
-        for raw_limit in (
-            getattr(tokenizer, "model_max_length", None),
-            getattr(model.config, "max_position_embeddings", None),
-        ):
-            if isinstance(raw_limit, int) and 0 < raw_limit < 1_000_000:
-                context_limits.append(raw_limit)
-        model_context_tokens = min(context_limits) if context_limits else None
+        metadata = getattr(model, "metadata", None)
+        if not isinstance(metadata, dict):
+            raise ValueError("local GGUF model does not expose readable metadata")
+        chat_template = metadata.get("tokenizer.chat_template") or metadata.get(
+            "tokenizer.chat_template.default"
+        )
+        if not isinstance(chat_template, str) or not chat_template.strip():
+            raise ValueError("local GGUF model must contain an embedded chat template")
+        self._chat_template_sha256 = _sha256_text(chat_template)
+        chat_format_module = getattr(llama_cpp, "llama_chat_format", None)
+        formatter_type = getattr(chat_format_module, "Jinja2ChatFormatter", None)
+        if formatter_type is None:
+            raise RuntimeError("installed llama-cpp-python cannot render GGUF chat templates")
+        eos_token_id = model.token_eos()
+        bos_token_id = model.token_bos()
+        eos_token = model.detokenize([eos_token_id], special=True).decode("utf-8")
+        bos_token = model.detokenize([bos_token_id], special=True).decode("utf-8")
+        chat_formatter = formatter_type(
+            template=chat_template,
+            eos_token=eos_token,
+            bos_token=bos_token,
+            stop_token_ids=[eos_token_id],
+        )
+        config = self.config
+        schema_payload = self.schema_payload
 
         def generate(batch: list[GenerationRequest]) -> list[GenerationResponse]:
-            results: dict[str, GenerationResponse] = {}
-            eligible: list[GenerationRequest] = []
-            input_token_counts: dict[str, int] = {}
+            results: list[GenerationResponse] = []
             for request in batch:
-                tokenized = tokenizer(
-                    request.prompt,
-                    add_special_tokens=True,
-                    truncation=False,
-                    return_attention_mask=False,
+                messages = [{"role": "user", "content": request.prompt}]
+                formatted = chat_formatter(messages=messages)
+                formatted_prompt = getattr(formatted, "prompt", None)
+                added_special = getattr(formatted, "added_special", None)
+                if not isinstance(formatted_prompt, str) or type(added_special) is not bool:
+                    raise ValueError("llama.cpp chat formatter returned an invalid prompt")
+                token_ids = model.tokenize(
+                    formatted_prompt.encode("utf-8"),
+                    add_bos=not added_special,
+                    special=True,
                 )
-                input_tokens = len(tokenized["input_ids"])
-                input_token_counts[request.request_id] = input_tokens
-                exceeds_model_context = (
-                    model_context_tokens is not None
-                    and input_tokens + self.config.max_new_tokens > model_context_tokens
-                )
-                if input_tokens > self.config.max_input_tokens or exceeds_model_context:
-                    results[request.request_id] = GenerationResponse(
+                if not isinstance(token_ids, list) or any(
+                    type(value) is not int for value in token_ids
+                ):
+                    raise ValueError("llama.cpp tokenizer returned an invalid token sequence")
+                input_tokens = len(token_ids)
+                if (
+                    input_tokens > config.max_input_tokens
+                    or input_tokens + config.max_new_tokens > config.context_tokens
+                ):
+                    results.append(
+                        GenerationResponse(
+                            request_id=request.request_id,
+                            input_too_long=True,
+                            input_token_count=input_tokens,
+                            output_token_count=0,
+                        )
+                    )
+                    continue
+                started_at = time.perf_counter()
+                try:
+                    raw = model.create_chat_completion(
+                        messages=messages,
+                        response_format={
+                            "type": "json_object",
+                            "schema": schema_payload,
+                        },
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=1,
+                        min_p=0.0,
+                        typical_p=1.0,
+                        repeat_penalty=1.0,
+                        frequency_penalty=0.0,
+                        presence_penalty=0.0,
+                        seed=config.seed,
+                        max_tokens=config.max_new_tokens,
+                        stream=False,
+                    )
+                except ValueError as exc:
+                    if (
+                        re.fullmatch(
+                            r"Requested tokens \(\d+\) exceed context window of \d+",
+                            str(exc),
+                        )
+                        is None
+                    ):
+                        raise
+                    results.append(
+                        GenerationResponse(
+                            request_id=request.request_id,
+                            input_too_long=True,
+                            input_token_count=input_tokens,
+                            output_token_count=0,
+                            generation_latency_seconds=time.perf_counter() - started_at,
+                        )
+                    )
+                    continue
+                latency = time.perf_counter() - started_at
+                if not isinstance(raw, dict):
+                    raise ValueError("llama.cpp chat completion returned a non-object response")
+                choices = raw.get("choices")
+                if not isinstance(choices, list) or len(choices) != 1:
+                    raise ValueError("llama.cpp chat completion must return exactly one choice")
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    raise ValueError("llama.cpp chat completion choice is invalid")
+                message = choice.get("message")
+                if not isinstance(message, dict):
+                    raise ValueError("llama.cpp chat completion message is invalid")
+                content = message.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("llama.cpp chat completion content is empty")
+                finish_reason = choice.get("finish_reason")
+                if finish_reason not in {"stop", "length"}:
+                    raise ValueError(
+                        "llama.cpp chat completion has unsupported finish_reason: "
+                        f"{finish_reason!r}"
+                    )
+                usage = raw.get("usage")
+                if not isinstance(usage, dict):
+                    raise ValueError("llama.cpp chat completion did not return token usage")
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                if (
+                    type(prompt_tokens) is not int
+                    or prompt_tokens < 0
+                    or type(completion_tokens) is not int
+                    or completion_tokens < 0
+                ):
+                    raise ValueError("llama.cpp chat completion token usage is invalid")
+                if prompt_tokens != input_tokens:
+                    raise ValueError(
+                        "llama.cpp formatted-prompt token count changed between preflight and "
+                        "generation"
+                    )
+                results.append(
+                    GenerationResponse(
                         request_id=request.request_id,
-                        input_too_long=True,
-                        input_token_count=input_tokens,
-                        output_token_count=0,
+                        generated_text=content,
+                        output_truncated=finish_reason == "length",
+                        input_token_count=prompt_tokens,
+                        output_token_count=completion_tokens,
+                        generation_latency_seconds=latency,
                     )
-                else:
-                    eligible.append(request)
-            if eligible:
-                encoded = tokenizer(
-                    [request.prompt for request in eligible],
-                    add_special_tokens=True,
-                    padding=True,
-                    truncation=False,
-                    return_tensors="pt",
-                ).to(device)
-                input_width = int(encoded["input_ids"].shape[1])
-                with torch.inference_mode():
-                    generated_ids = model.generate(
-                        **encoded,
-                        do_sample=False,
-                        num_beams=1,
-                        max_new_tokens=self.config.max_new_tokens,
-                        pad_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
-                eos_ids = tokenizer.eos_token_id
-                eos_set = (
-                    set(eos_ids)
-                    if isinstance(eos_ids, list)
-                    else {eos_ids}
-                    if eos_ids is not None
-                    else set()
                 )
-                for request, sequence in zip(eligible, generated_ids, strict=True):
-                    continuation = sequence[input_width:]
-                    padded_token_ids = continuation.detach().cpu().tolist()
-                    token_ids, terminated = _effective_generated_tokens(
-                        padded_token_ids,
-                        eos_ids=eos_set,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                    output_truncated = (
-                        not terminated and len(token_ids) >= self.config.max_new_tokens
-                    )
-                    results[request.request_id] = GenerationResponse(
-                        request_id=request.request_id,
-                        generated_text=tokenizer.decode(
-                            token_ids,
-                            skip_special_tokens=True,
-                        ),
-                        output_truncated=output_truncated,
-                        input_token_count=input_token_counts[request.request_id],
-                        output_token_count=len(token_ids),
-                    )
-            return [results[request.request_id] for request in batch]
+            return results
 
         return generate
 

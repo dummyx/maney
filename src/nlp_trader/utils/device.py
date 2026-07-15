@@ -1,7 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib import import_module
-from typing import Any
+from typing import Any, Literal
+
+
+@dataclass(frozen=True, slots=True)
+class LlamaCppDevice:
+    """Effective llama.cpp compute placement."""
+
+    name: Literal["metal", "cpu"]
+    gpu_layers: int
+
+
+def select_llama_cpp_device(llama_cpp: Any, requested_gpu_layers: int) -> LlamaCppDevice:
+    """Use Metal offload when the native binding supports it, otherwise use CPU."""
+
+    native = getattr(llama_cpp, "llama_cpp", llama_cpp)
+    supports_gpu_offload = getattr(native, "llama_supports_gpu_offload", None)
+    has_gpu_offload = bool(supports_gpu_offload()) if callable(supports_gpu_offload) else False
+    if requested_gpu_layers != 0 and has_gpu_offload:
+        return LlamaCppDevice(name="metal", gpu_layers=requested_gpu_layers)
+    return LlamaCppDevice(name="cpu", gpu_layers=0)
 
 
 def get_torch_device() -> Any:
