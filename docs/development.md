@@ -31,7 +31,8 @@ src/nlp_trader/
   data/                     local decoding, Parquet, raw store, model store, fixtures
   features/                 traditional/text feature and label builders
   models/                   walk-forward baselines and evaluation
-  nlp/                      preprocessing, linking, sentiment, optional transformer
+  nlp/                      preprocessing, linking, sentiment, optional transformer/LLM,
+                            semantic verifier, and DecisionRound ledger
   paper/                    programmatic in-memory simulator
   portfolio/                eligibility, construction, constraints, and exposures
   calendars.py              bounded exchange-calendar behavior
@@ -133,6 +134,8 @@ consume the reserved environment-secret settings.
 ## Change a model
 
 - Retain traditional-only, text-only, combined, and naive comparison paths.
+- In LLM augment mode, also retain the complete canonical `llm`, `traditional_llm`, and `all`
+  ablation paths without changing the conventional family meanings.
 - Keep walk-forward label availability strict.
 - Apply embargo/purging where overlapping outcomes require it.
 - Record model version, selected features, parameters, and training provenance.
@@ -162,6 +165,27 @@ No backtest or paper change authorizes live routing.
 - Validate score, label, and confidence outputs.
 - Add injected-predictor/cache tests and a small golden fixture.
 - Version the model and decoding behavior in the run snapshot.
+
+## Change optional generative LLM behavior
+
+- Keep the baseline independent of PyTorch and keep model loading local-files-only with remote custom
+  code disabled.
+- Preserve current-source-only prompts unless a separately designed, point-in-time evidence store is
+  added; do not imply that RAG, tools, or routing exist.
+- Keep conventional sentiment/event fields separate from `llm_*` fields. Augmentation must retain the
+  six canonical learned-family ablation.
+- Version and hash model, prompt, schema, verifier, decoding, and cache identity.
+- Persist each newly generated attempt before parsing, copy every consumed successful/cache response
+  into the run, and keep licensed/private text out of git.
+- Treat raw confidence as uncalibrated feature data, never a probability, signal magnitude, position
+  size, or portfolio weight.
+- Keep verifier claims precise: deterministic identity, timing, horizon, evidence-reference, and
+  numeric-token checks do not establish semantic truth.
+- Write DecisionRounds exclusively and replay-verify canonical JSON, timestamps, unique content IDs,
+  and hashes. Do not populate tool, calibration, portfolio, risk, order, or outcome fields until an
+  explicit later design extends that boundary.
+- Add injected-generator/cache/failure-before-parse, leakage, verifier, feature-family, ablation, and
+  DecisionRound tamper/replay tests without requiring a model download or MPS.
 
 ## Documentation ownership
 

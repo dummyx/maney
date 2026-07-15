@@ -17,12 +17,15 @@ The pipeline:
 
 1. captures local source files byte-for-byte;
 2. normalizes market and text records into typed Parquet tables;
-3. builds features using only information available by each decision time;
-4. creates forward labels separately from features;
-5. trains expanding walk-forward baseline models;
-6. compares traditional-only, text-only, combined, and naive strategies;
-7. runs a constrained, two-sided-cost backtest; and
-8. writes a readable research note plus an auditable run manifest.
+3. optionally extracts source-grounded LLM semantic signals and verifies their structural,
+   temporal, evidence-reference, horizon, and numeric-token contracts;
+4. builds features using only information available by each decision time;
+5. creates forward labels separately from features;
+6. trains expanding walk-forward baseline models;
+7. compares six fixed numeric, conventional-text, and LLM feature combinations plus naive strategies
+   when the LLM augmentation experiment is enabled;
+8. runs a constrained, two-sided-cost backtest; and
+9. writes a readable research note plus an auditable run manifest.
 
 The implemented daily strategy clock is deliberately narrow. For inputs delivered after the
 official close, such as the strict Japanese contract, the decision waits for the complete session
@@ -78,7 +81,7 @@ evidence of expected returns.
 | Backtest | Raw-price next-open entry, horizon-close liquidation, costs, constraints, logs, and reports |
 | Paper | Pending simulation-only intents with a hash-chained append-only event ledger; no fills, account state, or broker connection |
 | Broker | Standalone, explicitly confirmed kabuS cash-equity operations for a private single-user installation; never called by research or paper paths |
-| Optional NLP | Cached local transformer sentiment and local generative per-entity stance/event annotation, both disabled by default with MPS detection and CPU fallback |
+| Optional NLP | Cached local transformer sentiment and local generative per-entity semantic/evidence signals, both disabled by default with MPS detection and CPU fallback; LLM output is deterministically verified and recorded in replay-checked decision rounds |
 | Quality | Ruff, strict mypy, unit/property/integration/regression tests, and offline/no-sync CI checks on Ubuntu, Apple Silicon, and Windows |
 
 ## Choose a mode
@@ -172,9 +175,17 @@ contributors.
   quality remain the researcher’s responsibility.
 - With the bundled `local_files_only: true` settings, optional transformer and generative paths
   require their models already present on the machine. Tests never download one.
-- Generative annotations are retrospective text parsing, not historically deployed model output.
-  A modern model may encode facts learned after the research date even when its prompt contains only
-  point-in-time text; use blinded inputs and an exact historical model when that distinction matters.
+- Generative semantic signals are retrospective text parsing, not historically deployed model
+  output. A modern model may encode facts learned after the research date even when its prompt
+  contains only point-in-time text; use blinded inputs and an exact historical model when that
+  distinction matters.
+- The deterministic LLM verifier checks identity, candidate coverage, source timing, horizon,
+  evidence references, and whether numeric tokens in claims occur in cited source spans. It does not
+  prove that a prose claim or causal mechanism is true. Raw model confidence is uncalibrated and is
+  never a probability, signal magnitude, position size, or portfolio weight.
+- The current generative path uses only the current source item and host-supplied metadata. It has no
+  RAG, external retrieval, tools, model router, calibration model, or autonomous strategy-to-order
+  path.
 - There is no scraping, external market-data adapter, or autonomous strategy-to-order path. The only
   account connection is the separately invoked, operator-confirmed kabuS adapter described in
   [Broker integration](docs/broker.md).

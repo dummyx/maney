@@ -32,7 +32,9 @@ runs without being copied into every run directory.
 | What config actually ran? | `reports.../<run_id>/config.snapshot.json` |
 | What should a human read? | `reports.../<run_id>/research_note.md` |
 | Which captured source inputs and per-run outputs were used? | Final manifest and bronze-reference JSON |
-| What did the optional generative parser return? | `processed.../<run_id>/silver/llm_annotations/`, its evaluation summary, and per-run prompt/schema/provenance/response records |
+| What did the optional generative parser return? | `processed.../<run_id>/silver/llm_annotations/`, its processing/verification summaries, and per-run prompt/schema/provenance/generation/response records |
+| Can I audit and replay-check each LLM request? | `models.../<run_id>/llm_decisions/rounds.jsonl` |
+| How did the LLM feature families compare? | `processed.../<run_id>/evaluation/llm_ablation_comparison.json` in augment-mode backtests |
 | How did model families compare? | `processed.../<run_id>/evaluation/backtest_comparison.json` |
 | How good were predictions? | `processed.../<run_id>/evaluation/prediction_metrics.json` |
 | Which trades, costs, and constraints occurred? | `processed.../<run_id>/backtests/<family>/backtest.json` |
@@ -67,6 +69,8 @@ runs without being copied into every run directory.
   gold/predictions/model_family=<family>/year=<year>/part-*.parquet
   evaluation/prediction_metrics.json
   evaluation/llm_annotation_summary.json
+  evaluation/llm_verification_summary.json
+  evaluation/llm_ablation_comparison.json       # augment-mode backtest only
   evaluation/backtest_comparison.json
   evaluation/final_holdout_backtest_comparison.json
   backtests/<family>/backtest.json
@@ -78,7 +82,9 @@ runs without being copied into every run directory.
   llm_annotations/prompt.txt
   llm_annotations/schema.json
   llm_annotations/provenance.json
+  llm_annotations/generation_attempts/<cache-key>.json
   llm_annotations/responses/<cache-key>.json
+  llm_decisions/rounds.jsonl
   model_version=<version>/model.json
   model_version=<version>/metadata.json
   model_version=<version>/metrics/*.json
@@ -147,22 +153,63 @@ separately for transformer research.
 
 In contrast, an enabled generative annotator’s local model directory is hashed as a run input. Its
 logical ID, exact revision, license/terms reference, prompt and schema versions, decoding settings,
-and `retrospective_parser` status appear in annotation provenance. The shared cache is outside the
-run artifact roots, but every consumed raw response is copied to that run’s
-`models.../llm_annotations/responses/` directory and therefore enters the final artifact manifest.
+verifier version, optional configured token rates, and `retrospective_parser` status appear in
+annotation provenance. The shared cache is outside the run artifact roots, but every consumed raw
+response is copied to that run’s `models.../llm_annotations/responses/` directory. Per-run generation
+attempts and DecisionRounds also sit under the model run root, so all of them enter the final artifact
+manifest on success.
 
-### Generative annotation artifacts
+### Generative semantic/evidence artifacts
 
-`silver/llm_annotations/` contains validated sidecar rows keyed by `(item_id, asset_id)`, including
-stance/confidence, uncertainty, primary event/confidence, evidence span IDs, abstention information,
-source availability, and generation provenance. `evaluation/llm_annotation_summary.json` reports
-request, annotation, non-abstention, abstention, cited, event, and invalid-response counts plus the
-configured application mode; it is a processing summary, not a performance or profitability metric.
+`silver/llm_annotations/` contains verified sidecar rows keyed by `(item_id, asset_id)`. A v2 row
+records source availability and assigned decision time, stance, integer semantic signal, explicitly
+uncalibrated raw confidence, uncertainty, configured horizon, primary event/confidence, source-local
+supporting and counterevidence span IDs, mechanism, invalidation conditions, abstention information,
+source type/quality, verifier identity/result, and model/prompt/schema provenance.
+
+`evaluation/llm_annotation_summary.json` is a processing and inference-usage summary. It reports
+request/annotation/non-abstention/abstention/evidence/event counts; generated, cache-hit,
+deduplicated, and raw-attempt counts; generated token counts and latency; configured estimated cost
+when calculable; and the selected `feature_mode`. It is not an extraction-quality, performance, or
+profitability metric. Token totals and configured cost are null if any newly generated response lacks
+the required token counts. Run-level latency sums observed batch wall time once per batch; each
+generated DecisionRound retains that request's full observed batch latency rather than a divided
+allocation.
+
+`evaluation/llm_verification_summary.json` reports pass/fail counts for item identity, candidate
+coverage, temporal validity, horizon alignment, evidence-reference validity, and numeric-token
+grounding. The verifier establishes those deterministic contracts only. It does not prove that cited
+prose semantically supports a claim or that a mechanism is true.
 
 `prompt.txt` and `schema.json` freeze the exact instruction/output contracts. `provenance.json`
-records model/config/cache identities and makes the retrospective parsing assumption explicit.
-`responses/*.json` preserves the raw structured generations consumed by this run for audit. These
-files can repeat licensed or private source text and remain gitignored local artifacts.
+records model/config/cache/verifier identities, optional configured token rates, and the retrospective
+parsing assumption. Every newly generated response is first written to
+`generation_attempts/<cache-key>.json`, before parsing or verification, so malformed/truncated output
+survives a failed run for diagnosis. A successful generated or cache-backed response copied under
+`responses/<cache-key>.json` includes the exact raw generation, parsed annotation payload,
+verification result, and provenance used by the run. These files can repeat licensed or private
+source text and remain gitignored local artifacts. Cache replay strictly reparses the stored raw
+generation and requires it to reproduce the stored annotation payload before the response can affect
+features or a DecisionRound.
+
+Configured token rates are paired estimates, not vendor invoices. Without rates, the run estimate is
+null; a generated DecisionRound also keeps cost null when its required token counts are unavailable.
+Cache and in-run deduplicated DecisionRounds record zero new generation usage when rates are
+configured, rather than charging the original generation again.
+
+### LLM ablation comparison
+
+An augment-mode backtest writes `evaluation/llm_ablation_comparison.json` for both development and
+final holdout. It records fixed family semantics and three comparisons:
+
+- `llm` versus conventional `text`;
+- `traditional_llm` versus numeric `traditional`; and
+- `all` versus numeric-plus-conventional `combined`.
+
+Each comparison contains complete baseline/enhanced metric mappings and numeric
+`enhanced_minus_baseline` deltas. The artifact also repeats generated token, latency, and configured
+estimated-cost totals. These are arithmetic comparisons only—not statistical significance, causal
+attribution, profitability evidence, or an automatic promotion decision.
 
 ### `run.failed.json`
 
@@ -185,6 +232,32 @@ input paths fail before run creation, so those cases do not produce a failure ma
 
 The note intentionally labels results hypothetical. It is a report of assumptions and calculations,
 not an investment recommendation.
+
+## LLM DecisionRound ledger
+
+`models.../<run_id>/llm_decisions/rounds.jsonl` contains one immutable canonical-JSON object per LLM
+source request. Each record has a SHA-256 `round_id` over its canonical content and includes:
+
+- run/item/source identity, source availability, assigned decision time, and configured horizon;
+- exact model bytes identity, prompt/schema versions and hashes, and greedy sampling settings;
+- `source_scope: current_source_only` plus every numbered span ID exposed to the model;
+- exact raw generation and strict structured output;
+- every deterministic verifier check and result;
+- `generated`, `cache`, or `deduplicated` inference origin; and
+- available input/output tokens, latency, and configured estimated USD cost.
+
+The current schema deliberately requires empty tool-call, calibration, portfolio, risk, and order
+fields, and it has no realized-outcome field. A DecisionRound therefore audits the semantic parser;
+it is not a full portfolio decision trace and cannot be read as an order record.
+
+The pipeline writes the ledger exclusively and immediately replays it. Replay rejects blank or
+partial lines, invalid UTF-8/JSON, duplicate keys, noncanonical encodings, schema/timestamp failures,
+duplicate round IDs, a missing ledger path, and content whose hash does not match `round_id`. Round
+validation also binds passing structured output to strict raw JSON, rejects a passing truncated
+generation, and requires cache/deduplicated rounds to report no new inference usage. It validates the
+exact stored stochastic output instead of calling the model again. Passing replay does not establish
+semantic truth. This file is also distinct from the backtest replay below and the separate
+hash-chained paper event ledger.
 
 ## Backtest JSON
 

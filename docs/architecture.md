@@ -18,8 +18,9 @@ with [Workflows](workflows.md). For file formats and exact artifact locations, s
   open strictly after the safe decision timestamp and are built separately.
 - Each modeling family uses an expanding walk-forward baseline, then the same constrained and
   cost-aware replay.
-- Optional local generative annotation is a validated sidecar stage. It is disabled by default and
-  changes features only when application is separately enabled.
+- Optional local generative annotation emits strict semantic/evidence records, runs a deterministic
+  verifier, and writes replay-checked DecisionRounds. It is disabled by default and adds separate
+  `llm_*` features only in explicit augment mode.
 - The kabuS broker adapter is a standalone operator-invoked boundary, not a pipeline stage or a
   consumer of research predictions or paper intents.
 - The current filtered working set is materialized in Python, so full mode is not end-to-end
@@ -35,10 +36,12 @@ append-only bronze payloads + provenance sidecars
         |
         v
 silver assets, market bars + causal return-adjustment metadata, normalized text,
-optional fundamentals/calendar/actions, optional generative annotation sidecars, and text signals
+optional fundamentals/calendar/actions, optional verified generative semantic/evidence sidecars,
+and conventional text signals
         |
         v
-gold availability-safe daily decisions + later-open-to-horizon-close labels
+gold availability-safe daily decisions, optional separate LLM aggregates,
+plus later-open-to-horizon-close labels
         |
         v
 incremental expanding walk-forward models and predictions
@@ -49,6 +52,11 @@ constrained next-open round trips / pending paper intents
         v
 research note + immutable run manifest
 ```
+
+An enabled generative branch also writes exact generation/provenance artifacts and one
+content-identified DecisionRound per source request. The round ledger is replay-verified immediately
+after writing and ends at semantic parsing; it does not contain tools, calibration, portfolio, risk,
+orders, or realized outcomes.
 
 The stages are `ingest_market`, `ingest_text`, `annotate_text`, `build_features`, `build_labels`,
 `train`, `predict`, `backtest`, `paper`, and `report`. `annotate_text` depends on both ingestion
@@ -88,7 +96,9 @@ YAML files include the mode in those roots, but the runtime does not insert it a
   llm_annotations/prompt.txt
   llm_annotations/schema.json
   llm_annotations/provenance.json
+  llm_annotations/generation_attempts/*.json
   llm_annotations/responses/*.json
+  llm_decisions/rounds.jsonl
   model_version=<version>/
 <configured model root>/_cache/llm_annotations/*.json
 <configured report root>/<run_id>/
@@ -137,15 +147,16 @@ label counts so a long local run exposes forward progress without mutating its c
   validation, model artifacts, deterministic synthetic fixtures, and the strict local Japanese
   cash-equity record contract. It contains no vendor downloader or bundled real data.
 - `nlp/` owns deterministic preprocessing, entity linking, sentiment, incremental point-in-time
-  deduplication with a bounded candidate search, optional cached local transformer inference, and
-  strict local generative entity/event annotation.
+  deduplication with a bounded candidate search, optional cached local transformer inference, strict
+  local generative semantic/evidence annotation and verification, and the canonical DecisionRound
+  writer/replay reader.
 - `features/` owns market/text aggregation and label generation. Labels never run inside feature
   construction. The daily builders reject OHLC without the required positive causal return factor,
   point-in-time adjustment provenance, or complete/unique internal exchange sessions. Return features
   and labels use `raw_price * return_adjustment_factor`; execution prices remain raw.
 - `models/` owns incremental expanding development snapshots, the frozen pre-boundary final-holdout
-  fit, the fixed traditional/text/combined families, naive benchmarks, calibration tables, and
-  segmented prediction diagnostics.
+  fit, fixed conventional and optional LLM-ablation families, naive benchmarks, calibration tables,
+  and segmented prediction diagnostics.
 - `portfolio/` owns eligibility, construction, exposure calculation, and constraint enforcement.
 - `backtest/` owns independent non-overlapping next-open-to-horizon-close rounds, two-sided cost
   accounting, forced liquidation, period diagnostics, position/trade logs, and performance metrics.
@@ -194,19 +205,34 @@ transformer flag is folded into the typed config before run creation, so config 
 record the enabled state.
 
 The generative annotator uses the same optional dependency/device boundary. Its host constructs one
-source-grounded request per text item from deterministic, historically active asset candidates and
-numbered evidence spans. No price, label, later-document, web, or retrieval context enters the
-request. Strict validation rejects malformed responses and evidence/asset mismatches. Oversized
-requests abstain rather than silently truncating source text. In sidecar mode nothing downstream is
-changed; apply mode replaces only validated, non-abstained per-entity sentiment/event fields while
-retaining deterministic provenance, relevance, novelty/deduplication, credibility, and spam fields.
+source-grounded request per text item from deterministic, historically active asset candidates,
+source-local numbered spans, noisy source type/quality, the configured horizon, and a host-recorded
+safe market decision no earlier than source availability. The model prompt does not receive that
+decision timestamp. No price, label, later document, web/RAG, external tool, model router, return
+forecast, portfolio, or order context enters the request.
+
+Strict v2 validation requires per-asset stance, sign-consistent integer semantic signal, explicitly
+uncalibrated raw confidence, uncertainty, horizon, primary event/confidence, disjoint supporting and
+counterevidence IDs, mechanism, invalidation conditions, and valid abstention semantics. Oversized
+requests abstain rather than silently truncating source text. The deterministic verifier then checks
+item/candidate coverage, source timing, horizon alignment, evidence-reference membership, and that
+numeric tokens in claims occur in cited spans. This verifier does not prove semantic truth.
+
+In sidecar mode no LLM value enters gold features. Augment mode adds separate LLM coverage,
+abstention, semantic, confidence, uncertainty, event, evidence, and missingness aggregates; it never
+overwrites conventional sentiment/event fields. Transformer sentiment can coexist. The six learned
+families then isolate numeric, conventional-text, and LLM feature combinations in one backtest, with
+arithmetic ablation deltas reported separately.
 
 Model loading is local-files-only with remote custom code disabled. The local model directory is a
-hashed run input. Cache keys include exact request/candidate/model-directory and generation-contract
-identity, and every consumed response is copied under the run model root so the final artifact
-manifest can hash it. The source timestamp controls feature availability; annotation-stage completion
-time is audit metadata. Because pretraining may contain later facts, this is recorded as a retrospective
-parser rather than proof of historically deployable inference.
+hashed run input. Cache keys include exact request/candidate/model-directory and prompt/schema/
+verifier/decoding identity. Every new generation attempt is written before parsing, and every
+consumed successful/cache response is copied under the run model root. One canonical DecisionRound
+per source request records exact output, verifier checks, generated/cache/deduplicated origin, and
+available token/latency/configured-cost usage; the ledger is replay-verified without another model
+call. The source timestamp controls feature availability; annotation-stage completion time is audit
+metadata. Because pretraining may contain later facts, this remains a retrospective parser rather
+than proof of historically deployable inference.
 
 There is no scraping, data-vendor adapter, or autonomous strategy-to-order path. The standalone
 kabuS command group can transmit operator-prepared cash-equity orders, but the pipeline, backtests,

@@ -89,9 +89,18 @@ whose actionable time is no later than `asof_ts`.
 | Diversity | source count, unique-author count, author/source disagreement |
 | Credibility | mean source credibility, spam mean, credible-attention sum |
 | Events | event count/share/diversity/sentiment, event-source interaction, event-type counts |
+| Optional LLM | separate coverage/abstention, semantic, raw-confidence, uncertainty, event-confidence, supporting/counterevidence, agreement, and missingness aggregates |
 
 Age decay uses the configured half-life. A signal’s contribution halves once its age reaches
 `text_decay_half_life_days`.
+
+The optional `llm_*` columns never replace these conventional features. In each configured window,
+the LLM aggregation records annotation and non-abstention counts, annotation coverage, abstention
+rate, semantic mean, a raw-confidence-weighted semantic diagnostic, mean raw confidence and
+uncertainty, mean event confidence, supporting/counterevidence counts, evidence agreement, and
+explicit missingness. Only point-in-time-admissible, novelty-filtered independent signals enter these
+aggregates. Raw confidence is explicitly uncalibrated: it remains a feature and must not be read as a
+probability, semantic-signal magnitude, position size, or portfolio weight.
 
 ## Missingness behavior
 
@@ -100,6 +109,10 @@ When a window has no text, the builder writes:
 - zero for count/aggregate fields where a numeric identity is defined;
 - `None` where a value such as latest timestamp does not exist; and
 - explicit fields such as `text_missing_5d` and source/author missingness flags.
+
+Optional LLM fields use the same discipline. Counts and defined aggregate identities are zero, while
+`llm_missing_*` and field-specific missingness flags distinguish absent annotations/evidence from a
+genuine neutral semantic value. An abstention is counted but does not contribute a semantic value.
 
 Traditional short-history values follow the same principle. Risk metadata is handled conservatively:
 
@@ -164,11 +177,19 @@ It does not retain full key lists unless the internal diagnostic option is expli
 | Family | Score |
 |---|---|
 | `traditional` | Selected market/fundamental/event columns |
-| `text` | Selected text/sentiment/attention/novelty/event columns |
-| `combined` | Union of traditional and text columns |
+| `text` | Conventional text/sentiment/attention/novelty/event columns; never `llm_*` columns |
+| `combined` | Union of traditional and conventional text columns |
+| `llm` | Optional `llm_*` semantic/evidence aggregate columns only |
+| `traditional_llm` | Union of traditional and LLM columns |
+| `all` | Union of traditional, conventional text, and LLM columns |
 | `equal_weight` | Constant positive score |
 | `momentum_only` | `return_20d`, with 5d, 3d, then 1d fallback only if an earlier column is absent |
 | `no_trade` | Zero score |
+
+The three LLM families exist only in `llm_annotations.feature_mode: augment`; typed configuration
+then requires all six learned families in the order shown. Sidecar and disabled runs retain only the
+first three. This keeps the conventional comparison fixed instead of changing what `text` means when
+an LLM is enabled.
 
 `models.top_k` sets the depth of the long-side precision diagnostics and independently caps
 model-scored backtests and combined-model paper intents. The portfolio path first removes
@@ -198,6 +219,14 @@ boundary-overlapping label cross-section, preserving multi-session replay phase 
 out-of-order vendor delays. Inside the holdout, every prediction uses the same frozen pre-boundary
 fit; the evaluation protocol verifies and reports that untouched-training rule.
 
+An augment-mode backtest also writes `llm_ablation_comparison.json`. It compares `llm` with `text`,
+`traditional_llm` with `traditional`, and `all` with `combined` for both development and final
+holdout. Reported differences are arithmetic metric deltas only. They are not significance tests,
+causal attribution, profitability evidence, or an automatic promotion decision. The artifact also
+records generated token counts, generation latency, and configured estimated inference cost when
+available. Incomplete generated token accounting makes the token totals and configured cost null
+rather than zero or a partial estimate.
+
 ## Optional transformer sentiment
 
 When explicitly enabled, the local transformer replaces sentiment score/label/confidence in text
@@ -211,47 +240,61 @@ signals. It:
 
 Tests use an injected predictor and a small golden fixture; they never download a model.
 
-## Optional generative entity/event annotations
+## Optional generative semantic/evidence annotations
 
-The local generative path addresses one narrow baseline limitation: the deterministic scorer assigns
+The local generative path addresses one narrow baseline limitation: the conventional scorer assigns
 one document-level sentiment/event result to every linked entity. A document such as “Company A
-gains share while Company B cuts guidance” can instead receive separate entity-level stances and
-events.
+gains share while Company B cuts guidance” can instead receive separate, source-grounded entity
+signals without changing the conventional result.
 
 For each text item, the host supplies only deterministically linked, historically active asset
-candidates and numbered spans from the item itself. The validated structured result contains, per
-asset:
+candidates, numbered spans from that item, noisy source type/quality metadata, the first safe market
+decision at or after source availability, and the configured prediction horizon. There is no RAG,
+other-document retrieval, tool call, model router, price, label, return, portfolio, or order context.
 
-- `positive`, `negative`, `neutral`, or `abstain` stance plus confidence and uncertainty;
+The strict v2 result contains, per asset:
+
+- `positive`, `negative`, `neutral`, or `abstain` stance;
+- a sign-consistent integer `semantic_signal` in `[-2, 2]`;
+- `raw_confidence` and uncertainty in `[0, 1]`, with raw confidence explicitly uncalibrated;
+- the exact configured `horizon_days`;
 - at most one of `bankruptcy`, `merger_acquisition`, `guidance`, `earnings`, `dividend`,
-  `litigation`, `regulatory`, or `capital_raise`, or no event, plus confidence; and
-- one or more supplied evidence span IDs, or an explicit abstention reason.
+  `litigation`, `regulatory`, or `capital_raise`, or no event, plus event confidence;
+- disjoint supporting and counterevidence IDs drawn from the supplied source-local spans;
+- a concise mechanism and one or more invalidation conditions; and
+- strict empty/default fields plus an explicit reason for abstention.
 
-The host derives a sentiment score as direction times stance confidence. It rejects unknown or
-duplicate assets, bad evidence references, values outside their allowed ranges, and malformed output.
-Inputs that do not fit the configured context budget produce an explicit `input_too_long`
-abstention for every candidate instead of being silently truncated.
+An oversized request produces `input_too_long` abstentions instead of silently truncating the source.
+Every newly generated attempt is stored before parsing, including malformed or truncated output.
+Strict JSON/schema failure still fails the stage; the system does not silently repair it.
 
-The component is disabled by default. With annotation enabled but feature application disabled, it
-produces an auditable sidecar without changing any text signal or gold feature. Explicit application
-replaces only the matching `(item_id, asset_id)` sentiment/event fields for a valid, non-abstained
-annotation. An abstention keeps the deterministic sentiment/event result and is counted in the
-annotation summary. Entity linking, deduplication/novelty, relevance, source credibility, spam,
-source identity, and source availability stay deterministic in both modes.
+The deterministic verifier checks:
 
-Before applying a model, evaluate a frozen human-labeled set with
-`evaluate_annotation_set(...)`. The local evaluator reports stance and primary-event macro-F1,
-evidence precision, abstention and invalid-response rates, plus stance-confidence Brier and
-calibration diagnostics. These are extraction-quality metrics only; they consume no price, return,
-portfolio, or backtest outcome.
+1. response item identity and exact unique candidate coverage;
+2. `source_available_at <= decision_time`;
+3. returned horizon equality with the configured request horizon;
+4. membership of every supporting/counterevidence ID in the current source spans; and
+5. that each numeric token in a mechanism or invalidation condition occurs in the cited spans.
 
-Applied generative annotation and transformer sentiment are mutually exclusive. Transformer
-sentiment can still run while annotations are sidecar-only; in applied generative mode, abstained or
-missing annotations fall back specifically to the deterministic dictionary/event baseline.
+These checks establish structural and limited lexical grounding only. They do not prove that a cited
+span semantically supports the claim, that an event interpretation is correct, or that the proposed
+mechanism is true.
 
-This path performs local structured extraction. It does not retrieve documents, use RAG, forecast
-returns, select a portfolio, or generate orders. See [Research protocol](research_protocol.md) for
-the matched-run evaluation and pretrained-memory limitation.
+The component is disabled by default. `feature_mode: sidecar` writes verified Silver records, raw
+response/provenance artifacts, a verification summary, and replay-checked DecisionRounds without
+adding LLM values to gold features. `feature_mode: augment` adds separate `llm_*` fields and the six
+family ablation. Conventional sentiment/event values are never overwritten, so optional transformer
+sentiment can coexist with augmentation. An abstention remains visible through coverage, abstention,
+and missingness fields.
+
+Before augmentation, evaluate a frozen human-labeled set with `evaluate_annotation_set(...)`. The
+local evaluator reports stance and primary-event macro-F1, supporting- and counterevidence precision,
+horizon accuracy, abstention and invalid-response rates, plus raw-confidence Brier and calibration
+diagnostics. These are extraction-quality metrics only; raw confidence is not promoted to a
+calibrated probability and the evaluator consumes no price, return, portfolio, or backtest outcome.
+
+See [Research protocol](research_protocol.md) for the sidecar-first experiment and pretrained-memory
+limitation, and [Outputs](outputs.md) for the DecisionRound boundary.
 
 ## Current modeling limits
 
@@ -263,6 +306,8 @@ the matched-run evaluation and pretrained-memory limitation.
 - Full-mode training still consumes materialized filtered feature/label rows.
 - Generative annotation is retrospective parsing; source-time gating cannot prove that a modern
   pretrained model lacked later historical knowledge.
+- The LLM verifier does not establish semantic truth, and no RAG, external tools, model router, or
+  calibrated LLM meta-model is implemented.
 
 Use [Research protocol](research_protocol.md) to design evaluation and [Outputs](outputs.md) to find
 the exact model columns and metrics for a run.

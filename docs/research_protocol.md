@@ -36,21 +36,41 @@ gated by `available_at <= asof_ts`.
 
 ### Predeclare a generative-annotation experiment
 
-Treat optional generative annotation as a separate, frozen parser experiment. First evaluate a
-fixed labeled annotation set with stance macro-F1, event F1, evidence precision, abstention and
-invalid-output rates, and confidence calibration. Freeze the local model bytes, prompt version,
-output schema, decoding settings, and labeled set before running market evaluation.
+Treat optional generative annotation as a separate, frozen retrospective-parser experiment. First
+run `feature_mode: sidecar` and evaluate a fixed labeled annotation set with stance/event macro-F1,
+supporting- and counterevidence precision, horizon accuracy, abstention and invalid-output rates, and
+raw-confidence calibration diagnostics. Freeze the local model bytes, prompt version, output schema,
+verifier version, decoding settings, token-cost assumptions, and labeled set before market
+evaluation.
 
-Compare matched pipeline runs:
+Sidecar review must include the processing and deterministic-verification summaries, raw generation
+attempts, exact response artifacts, and replay-verified DecisionRound ledger. The verifier must pass
+its identity/coverage, timing, horizon, evidence-reference, and cited-numeric-token checks. Passing
+does not establish semantic truth; manually audit whether cited spans actually support the stance,
+event, mechanism, and invalidation conditions.
 
-1. deterministic baseline with generative annotation disabled; and
-2. the same data, universe, dates, costs, constraints, horizon, holdout, and random seeds with
-   annotation enabled and explicitly applied to features.
+For an applied experiment, create a new versioned config with `feature_mode: augment` and the exact
+six learned families:
 
-Use distinct feature/model versions. Traditional-only and naive families should be identical; only
-text and combined families may change. A sidecar-only run is useful for annotation review but is not
-an applied-LLM performance comparison. Preserve both positive and negative results, and do not tune
-the prompt/model on Sharpe or repeatedly inspect the final holdout.
+```text
+traditional, text, combined, llm, traditional_llm, all
+```
+
+Their meanings are fixed: numeric only, conventional text only, numeric plus conventional text, LLM
+only, numeric plus LLM, and all three feature groups. Conventional text is never overwritten. This
+single run produces matched development/final-holdout arithmetic comparisons for `llm` versus
+`text`, `traditional_llm` versus `traditional`, and `all` versus `combined`. Also retain a matched
+LLM-disabled baseline run with the same data, universe, dates, costs, constraints, horizon, holdout,
+and seeds when validating that enabling the subsystem did not affect conventional paths.
+
+Use distinct feature/model versions. A sidecar run is useful for annotation review but is not an
+applied-LLM performance comparison. Preserve positive and negative results; do not tune the prompt or
+model on Sharpe or repeatedly inspect the final holdout. The ablation artifact reports arithmetic
+deltas, not significance, causality, profitability, or automatic promotion.
+
+`semantic_signal` carries the model's discrete source interpretation. `raw_confidence` is explicitly
+uncalibrated and remains a separate feature; never treat it as a probability, signal magnitude,
+position size, or portfolio weight.
 
 Point-in-time prompts are necessary but not sufficient for historical validity. A modern pretrained
 model can encode facts learned after a source document’s `available_at`, even without retrieval or
@@ -72,6 +92,13 @@ completion it writes an exclusive final manifest containing:
 - input data manifest and hashes for every materialized artifact other than the final manifest itself
 - universe, period, rebalance frequency, and feature/label/model versions
 - cost model, portfolio constraints, metrics, known limitations, and next questions
+
+An enabled generative run additionally retains newly generated attempts before parsing, exact
+successful/cache response records, prompt/schema/verifier provenance, verified Silver rows,
+processing/verification summaries, and a canonical DecisionRound ledger. The ledger is written once
+and replay-verified from the stored output; it does not regenerate the model response. Its current
+scope ends at semantic parsing and deliberately contains no tools, calibration, portfolio, risk,
+orders, or realized outcome.
 
 CLI overrides are applied to the typed config before run creation. This includes runtime filters and
 the smoke command's transformer enable flag, so they affect the config hash and snapshot.
@@ -104,11 +131,18 @@ partial outcome, or non-terminal wholly censored group fails rather than selecti
 outcome availability. Only a common trailing group whose expected label ends all exceed the final
 decision boundary may be omitted.
 
-The typed config requires these three canonical model families, in this order:
+The typed config requires one of two canonical learned-family sets. Disabled and sidecar runs use
+these three, in order:
 
 - traditional-only
 - text-only
 - combined traditional plus text
+
+Augment runs append:
+
+- LLM semantic/evidence only
+- traditional plus LLM
+- traditional plus conventional text plus LLM (`all`)
 
 It also evaluates fixed naive benchmarks:
 
@@ -132,6 +166,11 @@ are fixed in code and use only decision-row context. Every family is then passed
 portfolio, two-sided cost, forced-liquidation, and backtest machinery. Compare the combined model
 with traditional-only and naive results; a positive combined backtest alone is not evidence that text
 added value.
+
+For augment runs, also inspect `llm_ablation_comparison.json` and its inference-usage block. A positive
+portfolio or prediction delta must not be described as LLM promotion: the current artifact performs
+no significance test, multiple-testing correction, causal attribution, or inference-cost subtraction
+from portfolio returns.
 
 The last configured fully observed periods are reported in a separate `final_holdout` section; the
 top-level family and segment metrics cover development periods only. Label availability strictly
@@ -166,7 +205,17 @@ Before accepting a result, verify:
   uses no future document.
 - Historical social metadata existed at the decision time and is licensed for retention.
 - A generative-annotation run is source-grounded, has valid evidence spans, declares its retrospective
-  status, and has no price, label, later-document, or retrieval context in its prompts.
+  status, and has no price, label, later-document, RAG, tool, router, return-forecast, portfolio, or
+  order context in its prompts.
+- Every enabled generative request has exact item/candidate coverage, `source_available_at <=
+  decision_time`, the configured horizon, valid source-local supporting/counterevidence references,
+  and no uncited numeric token in its mechanism or invalidation conditions. These checks are not a
+  substitute for human semantic-grounding review.
+- Raw LLM confidence is labeled uncalibrated and is used only as a feature; it is not a probability,
+  signal magnitude, position size, or portfolio weight.
+- The DecisionRound file replays successfully and is interpreted within its actual scope: stored
+  generation and verifier audit only, with no tool, calibration, portfolio, risk, order, or outcome
+  trace.
 - Model selection did not use the reserved final test period.
 - Commission, spread, slippage, impact, borrow, turnover, participation, liquidity, and fill
   assumptions are appropriate for the data and strategy.

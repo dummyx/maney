@@ -35,11 +35,11 @@ capturing its own outputs as source data.
 | `paths` | mapping | Required inputs, optional point-in-time inputs, and artifact roots. |
 | `data` | mapping | Storage, calendar, schema, and licensing metadata. |
 | `features` | mapping | Windows, warm-up, horizon, decay, and version identifiers. |
-| `models` | mapping | Fixed baseline families and walk-forward training controls. |
+| `models` | mapping | Canonical baseline or LLM-ablation families and walk-forward training controls. |
 | `backtest` | mapping | Cost model, constraints, capital, and rebalance settings. |
 | `runtime` | mapping | Optional date, symbol, and complete-decision limits. |
 | `transformer` | mapping | Optional local transformer inference settings. |
-| `llm_annotations` | mapping | Optional local generative entity-stance/event annotation settings. |
+| `llm_annotations` | mapping | Optional local generative semantic/evidence signal, verifier, and inference-accounting settings. |
 
 ## `paths`
 
@@ -115,14 +115,26 @@ records for the exact local exports. See [Japan cash-equity baseline](japan_base
 
 | Field | Rule | Meaning |
 |---|---|---|
-| `families` | exactly `[traditional, text, combined]` | The canonical baselines, in this order. |
+| `families` | one of the two exact ordered sets below | The canonical conventional baseline or LLM-ablation families. |
 | `min_train_rows` | integer ≥ 2 | Minimum eligible historical rows before a snapshot is fitted. |
 | `embargo_periods` | integer ≥ 0 | Recent decision periods excluded from the training cutoff. |
 | `final_holdout_periods` | integer ≥ `features.horizon_days` | Number of final fully observed decision periods reserved from development diagnostics and reported separately. |
 | `top_k` | integer ≥ 1 | Ranking depth used by evaluation and model-scored backtest/paper selection. Equal-weight and no-trade references are uncapped. |
 
-Equal-weight, momentum-only, and no-trade benchmarks are added automatically; do not list them in
-`families`.
+The accepted family sets are:
+
+```yaml
+# Deterministic/conventional baseline
+families: [traditional, text, combined]
+
+# Required when llm_annotations.feature_mode is augment
+families: [traditional, text, combined, llm, traditional_llm, all]
+```
+
+The first three keep fixed meanings: `traditional` is deterministic numeric data, `text` is
+conventional text only, and `combined` is their union. The additional families isolate LLM-only,
+numeric-plus-LLM, and all-three feature paths without changing the conventional columns. Equal-weight,
+momentum-only, and no-trade benchmarks are added automatically; do not list them in `families`.
 
 The holdout boundary is chronological and counts only fully observed whole cross-sections. It is an
 evaluation boundary, not protection against a researcher repeatedly inspecting and tuning to the same
@@ -174,7 +186,7 @@ All cost inputs must be non-negative. See [Backtesting](backtesting.md) for the 
 |---|---:|---|
 | `initial_capital` | `1000000` | Converts weights into notional for participation and capacity proxies. |
 | `rebalance_frequency` | `1d` | Positive integer days; must match the configured feature horizon. |
-| `benchmark` | `equal_weight` | Recorded benchmark identifier. It does not select which families run; all six current families are replayed. |
+| `benchmark` | `equal_weight` | Recorded benchmark identifier. It does not select which families run; every configured learned family plus equal-weight, momentum-only, and no-trade is replayed. |
 
 ## `runtime`
 
@@ -239,46 +251,66 @@ explicit, licensed, reproducible choice.
 ## `llm_annotations`
 
 This separate optional component runs a local causal language model to produce validated per-entity
-stance/event annotations. It is disabled in every bundled config, so the deterministic sample and
-baseline do not require a model or PyTorch.
+semantic/evidence signals. It is disabled and local-files-only in every bundled config, so the
+deterministic sample and baseline do not require a model or PyTorch.
 
 | Field | Default or allowed value | Meaning |
 |---|---|---|
 | `enabled` | `false` | Runs the annotation stage when true. |
-| `apply_to_features` | `false` | When true, applies valid non-abstained entity annotations to text-signal sentiment/event fields. Requires `enabled: true`. |
+| `feature_mode` | `sidecar` or `augment` | `sidecar` records verified output without adding LLM feature values. `augment` adds separate `llm_*` columns and requires `enabled: true` plus the six canonical LLM-ablation model families. |
 | `backend` | `transformers_causal_lm` | Local Hugging Face causal-LM backend. |
 | `model_id` | `null` | Stable human/model-registry identifier; required when enabled. It is recorded separately from `paths.llm_model`. |
 | `model_revision` | `null` | Exact immutable model revision/version; required when enabled. |
 | `model_license_or_terms_ref` | `null` | Human-resolvable license/terms reference for local model use; required when enabled. |
-| `prompt_version` | `entity-event-v1` | Version included in prompt provenance and cache identity. |
-| `schema_version` | `entity-event-v1` | Version of the validated structured-output contract. |
+| `prompt_version` | `semantic-evidence-v2` | Version included in prompt provenance and cache identity. |
+| `schema_version` | `semantic-signal-v2` | Version of the validated structured-output contract. |
+| `verifier_version` | `semantic-evidence-verifier-v1` | Version of the deterministic request/response verifier and cache identity. |
 | `batch_size` | `1`, integer ≥ 1 | Configurable generation batch size. |
 | `max_input_tokens` | `2048`, integer ≥ 1 | Context budget; an oversized request abstains rather than silently truncating source text. |
 | `max_new_tokens` | `384`, integer ≥ 1 | Maximum generated tokens per request. |
 | `decoding` | `greedy` | Deterministic decoding policy. |
 | `seed` | `7`, integer | Recorded generation seed. |
+| `input_cost_per_million_tokens_usd` | `null` or non-negative float | Optional configured input-token rate used only to estimate cost for newly generated responses with recorded token counts. |
+| `output_cost_per_million_tokens_usd` | `null` or non-negative float | Optional configured output-token rate. It must be set together with the input rate. |
 | `local_files_only` | `true` | Forbids model/tokenizer downloads; keep true for this local-only component. |
 | `trust_remote_code` | `false` | Prevents execution of model-repository custom code; keep false. |
 
 `paths.llm_model` must name the local model directory when enabled. The run input manifest hashes
 its exact files, while the config and annotation provenance retain the logical ID/revision/license,
-prompt/schema versions, decoding settings, and context limits. Inference uses central MPS-or-CPU
-device selection. Tests inject a generator and never load or download a real model.
+prompt/schema/verifier versions, decoding settings, context limits, and optional token rates.
+Inference uses central MPS-or-CPU device selection. Tests inject a generator and never load or
+download a real model. Configured costs are estimates, not invoices; if rates or token counts are
+unavailable for a generated response, its per-round estimated cost remains null rather than being
+invented. If any newly generated response lacks token counts, run-level token totals and configured
+cost are null rather than partial. Without configured rates, the run-level cost estimate is also
+null.
 
 The two enabled modes are intentionally distinct:
 
-- `enabled: true`, `apply_to_features: false` writes a sidecar for review without changing the
-  deterministic feature path;
-- `enabled: true`, `apply_to_features: true` replaces only valid, non-abstained per-entity
-  sentiment/event fields. Explicit abstentions retain the deterministic values and are counted.
+- `enabled: true`, `feature_mode: sidecar` writes verified sidecars and decision-round audit records
+  for review without adding LLM values to gold features;
+- `enabled: true`, `feature_mode: augment` adds separate LLM semantic, confidence, uncertainty,
+  event, evidence, coverage, abstention, and missingness columns. It does not replace conventional
+  sentiment or event values.
 
-`transformer.enabled: true` may coexist with sidecar-only annotation, but it cannot be combined with
-`llm_annotations.apply_to_features: true`: both would compete to replace sentiment fields, so config
-validation rejects that combination.
+Transformer sentiment may coexist with either mode. When enabled, it supplies the conventional text
+sentiment fields while LLM augmentation remains isolated under `llm_*` columns.
 
-Do not switch `apply_to_features` within one experiment or treat a sidecar-only run as an LLM trading
-comparison. Use matched disabled/applied runs with distinct feature/model versions; see
-[Research protocol](research_protocol.md).
+The v2 structured output contains stance, an integer `semantic_signal` from -2 through 2,
+uncalibrated `raw_confidence`, uncertainty, the configured horizon, primary event and confidence,
+supporting and counterevidence span IDs, mechanism, invalidation conditions, and explicit abstention.
+Raw confidence is a feature only: it is not a probability, semantic-signal magnitude, position size,
+or portfolio weight.
+
+The deterministic verifier requires exact item/candidate coverage, source availability no later than
+the decision, the configured horizon, known source-local evidence span references, and numeric tokens
+in mechanisms/invalidation conditions to occur in cited spans. These checks do not prove that a prose
+claim, event interpretation, or mechanism is semantically true. The current prompt uses only the
+current source item; no RAG, external retrieval, tools, or model router is implemented.
+
+Do not switch `feature_mode` within one experiment or treat a sidecar-only run as an applied-LLM
+performance comparison. Predeclare sidecar review and augment ablations with distinct feature/model
+versions; see [Research protocol](research_protocol.md).
 
 ## Validate before running
 

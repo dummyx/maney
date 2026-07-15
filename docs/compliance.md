@@ -48,15 +48,32 @@ and the [Japan baseline preparation guide](japan_baseline.md).
   identifiers or restricted text, hashing in silver does not remove it from bronze; keep the raw root
   private and ingest only data whose retention is permitted.
 - Optional generative prompts, raw responses, and caches can repeat licensed/private source text.
-  Keep them local and gitignored, apply the source’s retention/transformation terms, and record the
-  local model’s license or terms reference. Model access does not expand the rights granted by the
-  source license.
+  Generation-attempt records, verified Silver rows, and DecisionRound ledgers can do the same. Keep
+  them local and gitignored, apply the source’s retention/transformation terms, and record the local
+  model’s license or terms reference. Model access does not expand the rights granted by the source
+  license.
 
-The generative component is a constrained entity-stance/event parser. It receives no external RAG
-or web context, may cite only supplied source spans, and must abstain rather than invent missing
-facts. It is not authorized to predict returns, recommend trades, or generate orders. Historical
-source timestamps also do not eliminate knowledge embedded during model pretraining; reports must
-identify this as a retrospective-parser limitation unless the exact model is historically valid.
+The generative component is a constrained semantic/evidence parser. It receives only the current
+source item, host-linked candidates, source-local numbered spans, noisy source type/quality, and the
+configured horizon. The host records a safe decision time, but that date is omitted from the model
+prompt. The model receives no external RAG/web context, other documents, tools, router, prices,
+labels, portfolio state, or account state. It may cite only supplied source spans and must abstain
+rather than invent missing facts. Its integer semantic signal and explicitly uncalibrated raw
+confidence are research features, not return forecasts, probabilities, position sizes, portfolio
+weights, recommendations, or orders.
+
+The deterministic verifier checks identity/candidate coverage, source timing, horizon, evidence
+references, and whether numeric tokens in claims occur in cited spans. It does not prove that the
+source is true, that cited prose semantically supports the claim, or that the mechanism is correct.
+Source-quality metadata is noisy research context, not an endorsement. Historical source timestamps
+also do not eliminate knowledge embedded during model pretraining; reports must identify this as a
+retrospective-parser limitation unless the exact model is historically valid.
+
+DecisionRounds freeze exact model/prompt/schema/sampling identity, current-source evidence IDs, raw
+and structured output, verifier results, generated/cache/deduplicated origin, and available usage
+metadata. Their current schema intentionally contains no tools, calibration, portfolio, risk, orders,
+or realized outcome. Replay validates the stored record; it does not rerun the model, authenticate the
+ledger externally, or establish semantic truth.
 
 ## Secrets and local artifacts
 

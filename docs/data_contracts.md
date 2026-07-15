@@ -14,6 +14,7 @@ examples in supplier-friendly form.
 |---|---|
 | Input to bronze | Source bytes and provenance are captured without mutation. |
 | Bronze to silver | Records are typed, UTC-normalized, canonically linked, and partitioned. |
+| Source to optional LLM signal | The source is available by the assigned decision, every cited span belongs to that source, the horizon matches configuration, and deterministic verification passes. |
 | Silver to gold features | Every contributing value is available no later than the decision. |
 | Silver to gold labels | The outcome starts strictly after the decision on official sessions. |
 | Gold to model | Training includes only labels observable before the embargoed cutoff. |
@@ -64,6 +65,11 @@ Every text-derived feature is built from signals satisfying `available_at <= aso
 also record latest input availability by window, and both feature construction and the Parquet
 feature store reject future provenance or duplicate canonical keys.
 
+For optional generative signals, the host assigns the first safe market decision at or after the
+source `available_at` and supplies `features.horizon_days` as the target horizon. The verifier rejects
+`source_available_at > decision_time` or a returned horizon that differs from the request. Annotation
+stage completion time is audit metadata and never becomes historical feature availability.
+
 ## Core records
 
 - `Asset`: stable asset ID, symbol, exchange, currency, name, sector/industry, active interval,
@@ -87,8 +93,19 @@ contract is documented in [Japan cash-equity baseline](japan_baseline.md).
   availability timestamps, SHA-256 author/URL identifiers, entities, event fields, relationship type,
   hashed parent item, content status, retention permission, and terms reference.
 - `EntityMention`: optional linked asset/symbol, name, relevance, mention type, and confidence.
-- `TextSignal`: asset-linked sentiment, confidence, relevance, novelty, credibility, source,
-  deduplication, spam/disagreement/event fields, availability, and model version.
+- `TextSignal`: asset-linked conventional sentiment, confidence, relevance, novelty, credibility,
+  source, deduplication, spam/disagreement/event fields, availability, and model version, plus
+  optional separate LLM semantic, raw-confidence, uncertainty, event-confidence, evidence-count, and
+  abstention fields.
+- `EntityAnnotation`: one strict per-item/per-asset LLM result containing stance, integer semantic
+  signal in `[-2, 2]`, explicitly uncalibrated raw confidence, uncertainty, configured horizon,
+  primary event/confidence, source-local supporting and counterevidence span IDs, mechanism,
+  invalidation conditions, and abstention state.
+- `DecisionRound`: a content-identified audit record for one LLM request. It freezes source/model/
+  prompt/schema/sampling identity, current-source evidence IDs, exact raw and structured output,
+  verifier checks, generated/cache/deduplicated origin, and available token/latency/configured-cost
+  usage. Its tool, calibration, portfolio, risk, and order fields are empty, and it has no realized
+  outcome field.
 - `FeatureRow`, `LabelRow`, and `PredictionRow`: explicit as-of time, horizon, and feature/label/model
   version.
 - `OrderIntent`: target-weight research intent with reason and risk fields. `PaperOrderIntent` carries
@@ -177,21 +194,38 @@ item IDs before silver materialization; supplied hash fields must be lowercase S
 `retention_permitted=false` is rejected.
 
 Optional generative annotations are sidecar records keyed by `(item_id, asset_id)`. Raw model output
-must be one strict JSON object whose only top-level field is `annotations`. Each valid per-asset
-record contains a closed-set stance label and confidence, uncertainty, at most one closed-set primary
-event and confidence, source evidence span IDs, and an explicit abstention reason when applicable.
-The host, not the model, derives the numeric sentiment score and supplies item, asset, timestamp, and
-provenance identity. Unknown/duplicate/missing assets, unrecognized labels/events, non-finite or
-out-of-range values, and unknown or duplicate evidence IDs fail validation. Malformed model output
-fails the whole uncached generation batch before annotation-cache or annotation-artifact writes
-rather than being silently repaired.
+must be one strict JSON object whose only top-level field is `annotations`. Each valid per-asset v2
+record contains:
 
-Annotation availability never overrides source availability: every applied annotation retains the
-source `available_at`, and feature construction still enforces `available_at <= asof_ts`. Generated
-text is not accepted as factual input. When feature application is disabled, annotations remain
-sidecars and cannot change gold features; when it is explicitly enabled, only valid, non-abstained
-entity stance/event fields replace their deterministic counterparts. Deterministic linking,
-relevance, novelty/deduplication, credibility, spam, source, and availability fields remain intact.
+- a closed-set stance and a sign-consistent integer `semantic_signal` from -2 through 2;
+- `raw_confidence` and uncertainty in `[0, 1]`, with raw confidence explicitly uncalibrated;
+- the exact configured positive `horizon_days`;
+- at most one closed-set primary event plus confidence;
+- unique, disjoint supporting and counterevidence IDs drawn from the current source's numbered
+  `S<number>` spans;
+- a nonempty mechanism and at least one unique invalidation condition for a non-abstained result; and
+- strict empty/default values plus a reason for abstention.
+
+The host supplies item, asset, source availability, decision time, horizon, source type/quality, and
+provenance identity. Source quality is a noisy feature, not proof. Unknown/duplicate/missing assets,
+unrecognized labels/events, invalid signal direction, non-finite or out-of-range values, and unknown,
+duplicate, or overlapping evidence IDs fail validation. Every newly generated raw attempt is written
+before strict parsing so a malformed response remains diagnosable; malformed output still fails the
+stage before a validated cache record, Silver annotation, or DecisionRound is written.
+
+The deterministic verifier checks exact item and candidate coverage, source availability no later
+than decision time, requested/returned horizon equality, evidence-reference membership, and whether
+each numeric token in a mechanism or invalidation condition occurs in the cited spans. Passing these
+checks does not prove that the cited prose supports the interpretation or that a causal mechanism is
+true.
+
+Annotation availability never overrides source availability: every annotation retains the source
+`available_at`, and feature construction still enforces `available_at <= asof_ts`. Generated text is
+not accepted as factual input. In `sidecar` mode, annotations cannot change gold features. In
+`augment` mode, valid annotations add distinct `llm_*` values; they never overwrite conventional
+sentiment/event fields. Deterministic linking, relevance, novelty/deduplication, credibility, spam,
+source, and availability fields remain intact. Transformer sentiment may therefore coexist with LLM
+augmentation.
 
 ## Gold: features, labels, and predictions
 
@@ -214,6 +248,18 @@ source reads use lazy scans and streaming collection.
 Those filtered results and downstream feature, label, and model rows are currently materialized in
 Python, so full-mode windows must be sized to available local memory; the pipeline is not end-to-end
 out-of-core.
+
+When `feature_mode: augment` is enabled, every configured text window also carries separate LLM
+coverage, non-abstention/abstention, semantic, raw-confidence, uncertainty, event-confidence,
+supporting/counterevidence, agreement, and explicit missingness aggregates. Raw confidence remains a
+model feature, not a probability, semantic-signal magnitude, position size, or portfolio weight.
+
+Enabled LLM runs write canonical JSONL DecisionRounds under
+`<models root>/<run_id>/llm_decisions/rounds.jsonl`, then immediately replay and verify the file.
+Replay rejects malformed/noncanonical JSON, schema or timestamp violations, duplicate round IDs, and
+content hashes that do not match `round_id`. It reuses the stored stochastic output; it does not call
+the model again or establish the semantic truth of that output. This ledger is distinct from both the
+hash-chained paper-event ledger and the deterministic portfolio backtest replay.
 
 ## Local input requirements
 

@@ -44,7 +44,7 @@ the backtest.
 |---|---|---|
 | `ingest-market` | none | Bronze references and silver assets, bars, and configured optional records |
 | `ingest-text` | loads/captures the filtered asset master internally | Bronze references and normalized silver text |
-| `annotate-text` | market + text ingestion | Optional validated generative sidecars, provenance, and summary; no output when disabled |
+| `annotate-text` | market + text ingestion | Optional v2 semantic/evidence sidecars, deterministic verification, raw/provenance records, and replay-checked DecisionRounds; no output when disabled |
 | `build-features` | text annotation stage | Silver text signals and gold feature table |
 | `build-labels` | market ingestion | Gold label table |
 | `train` | features + labels | Versioned model artifact |
@@ -213,10 +213,10 @@ Set `transformer.model_name` to a model already present locally first. Keep
 `transformer.local_files_only: true` for an offline, reproducible run. Outputs are cached by normalized
 text/model identity.
 
-### Optional local generative entity/event annotation
+### Optional local generative semantic/evidence annotation
 
 First edit a copied config: set `paths.llm_model` to an immutable local model directory, fill the
-model ID/revision/license fields, and enable annotation. Keep feature application off for the first
+model ID/revision/license fields, and enable annotation. Keep `feature_mode: sidecar` for the first
 review run:
 
 ```yaml
@@ -224,7 +224,7 @@ paths:
   llm_model: /absolute/path/to/immutable/local-model
 llm_annotations:
   enabled: true
-  apply_to_features: false
+  feature_mode: sidecar
   model_id: local-model-id
   model_revision: exact-local-revision
   model_license_or_terms_ref: local-license-record
@@ -239,30 +239,71 @@ uv run nlp-trader annotate-text --config configs/local.yaml
 
 `annotate-text` runs both ingestion prerequisites. `build-features` and every downstream stage also
 run it automatically because it is a dependency. With `enabled: false`, the stage is a no-op and the
-deterministic sample output is unchanged. With sidecar mode above, validated annotations, raw local
-responses, prompt/schema/provenance, and a summary are written, but text signals and features remain
-deterministic.
+deterministic sample output is unchanged. With sidecar mode above, the stage writes:
 
-After reviewing task-level accuracy and freezing the model, prompt, schema, and decoding settings,
-set `apply_to_features: true` in a new versioned config and run a matched experiment. Valid
-non-abstained results replace only the corresponding entity’s sentiment/event fields; abstentions
-fall back to the deterministic values. The component uses no external retrieval, future context,
-prices, labels, return forecasts, or order generation. The shared cache is keyed by exact input,
-candidate, model-directory, prompt/schema, and decoding identity.
+- the exact prompt, output schema, model/verifier provenance, and successful response/cache records;
+- every newly generated raw attempt before parsing, so malformed output remains available in a
+  failed run for diagnosis;
+- verified per-entity Silver semantic/evidence rows and processing/verification summaries; and
+- `models.../<run_id>/llm_decisions/rounds.jsonl`, which is immediately replayed and verified.
+
+The DecisionRound records whether each request was newly generated, a cache hit, or deduplicated. It
+also retains exact output, verifier checks, available token/latency values, and optional configured
+estimated cost. This first implementation has no tool, calibration, portfolio, risk, order, or
+outcome content in the round.
+
+Cache replay reparses the stored raw generation and requires an exact match with the stored
+structured payload. DecisionRound validation repeats that raw/structured binding for passing rounds,
+rejects passing truncated generations, and requires cache/deduplicated rounds to carry no new
+inference usage. A missing ledger path is an error; an intentionally empty enabled run still writes
+and verifies an empty file.
+
+The v2 prompt uses only the current source item, host-linked candidates, source-local numbered spans,
+source type/quality, and the configured horizon. The host request contract records the safe decision
+time, but the model prompt does not receive a date. It has no RAG, other-document retrieval, external
+tools, model router, prices, labels, return forecasts, or order generation. The deterministic
+verifier checks identity/coverage, timing, horizon, evidence references, and cited numeric tokens; it
+does not prove that the prose interpretation is true.
+
+After reviewing task-level accuracy and freezing the model, prompt, schema, verifier, decoding, and
+labeled evaluation set, create a new versioned config for augmentation:
+
+```yaml
+models:
+  families: [traditional, text, combined, llm, traditional_llm, all]
+llm_annotations:
+  enabled: true
+  feature_mode: augment
+  model_id: local-model-id
+  model_revision: exact-local-revision
+  model_license_or_terms_ref: local-license-record
+```
+
+Augmentation adds separate `llm_*` values; it never replaces conventional text sentiment or events.
+Transformer sentiment may coexist. The shared cache is keyed by exact input, candidate,
+model-directory, prompt/schema/verifier, and decoding identity. A complete augment backtest writes the
+six family results plus `evaluation/llm_ablation_comparison.json`; its differences are arithmetic
+diagnostics, not a promotion decision.
 
 ## Model selection details
 
 `models.top_k` sets the depth of the long-side precision-at-k diagnostic and caps the candidate set
-for traditional, text, combined, and momentum backtests plus latest combined paper intents. The
-portfolio path applies direction eligibility before absolute-score ranking; that selection is
-deliberately distinct from raw-score-descending precision-at-k. Exposure, turnover, and participation
-constraints follow. Equal-weight and no-trade reference paths remain uncapped.
+for every configured learned family and momentum backtests plus latest `combined` paper intents. In
+augment mode, the family meanings are fixed: `traditional` is numeric, `text` is conventional text,
+`combined` is their union, `llm` is LLM-only, `traditional_llm` is numeric plus LLM, and `all` uses all
+three feature groups. The portfolio path applies direction eligibility before absolute-score ranking;
+that selection is deliberately distinct from raw-score-descending precision-at-k. Exposure, turnover,
+and participation constraints follow. Equal-weight and no-trade reference paths remain uncapped.
 
 ## Validation and failures
 
 An invalid config fails before a run directory is created. A failure after run creation writes
 `run.failed.json` and preserves partial artifacts for diagnosis. The failure manifest records the
 exception type and message but not a traceback.
+
+For a newly generated LLM response, the raw generation-attempt file is created before strict parsing.
+A malformed response or verifier failure therefore leaves the attempt for diagnosis but does not
+write a validated cache record, Silver annotation, or DecisionRound for that request.
 
 See [Troubleshooting](troubleshooting.md) for common errors and [Outputs](outputs.md) for the artifact
 layout.
