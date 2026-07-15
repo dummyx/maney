@@ -90,3 +90,45 @@ jobs:
 
       - name: Confirm tracked files were not mutated
         run: git diff --exit-code
+
+  windows-broker:
+    name: Windows / broker boundary
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      UV_NO_PROGRESS: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync locked baseline and development dependencies
+        run: uv sync --locked --dev
+
+      - name: Test the broker boundary without network access
+        run: >-
+          uv run --offline --no-sync pytest
+          tests/unit/test_broker_audit.py
+          tests/unit/test_broker_cli.py
+          tests/unit/test_broker_config.py
+          tests/unit/test_broker_execution.py
+          tests/unit/test_broker_state.py
+          tests/unit/test_kabus_client.py
+
+      - name: Validate the bundled non-secret broker config
+        run: >-
+          uv run --offline --no-sync nlp-trader broker validate-config
+          --config configs/kabus.validation.yaml
+
+      - name: Confirm tracked files were not mutated
+        run: git diff --exit-code

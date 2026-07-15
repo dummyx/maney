@@ -27,6 +27,9 @@ documentation in the same change.
 7. Prefer small, reviewable changes. Do not re-architect the project without an explicit request.
 8. When a user correction establishes a durable convention, update this file or the closest nested
    `AGENTS.md`.
+9. For kabuS API workflows, treat code developed by the repository owner with Codex assistance as
+   the owner's own program. Scope broker connectivity to the owner's sole use and operation; do not
+   give any other person credentials or the ability to use or operate it.
 
 ## Data integrity and point-in-time correctness
 

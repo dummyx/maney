@@ -1,0 +1,35 @@
+# Strict non-secret validation example. Broker audit, kill switch, and operation lock use the fixed
+# current-user state root; never add credentials or path overrides here.
+schema_version: kabus-broker-v1
+provider: kabus
+environment: validation
+enabled: true
+order_submission_enabled: true
+production_acknowledgement: null
+single_user_private_use: true
+account_type: 4
+# DelivType 2 uses the symbol-specific AuKCStockAccountWallet; use 3 only with the corresponding
+# linked-bank facility, where preflight instead uses StockAccountWallet.
+cash_buy_deliv_type: 2
+cash_buy_fund_type: "02"
+allowed_symbols: ["9433"]
+# New direct TSE Exchange 1 is a maintenance-only exception and intentionally unsupported. TSE+
+# routes as 27; its intent uses reference_exchange 1 only for symbol and quote lookups. The
+# symbol-specific wallet lookup uses the actual order route, 27.
+allowed_exchanges: [27]
+allow_market_orders: false
+max_order_quantity: 100
+max_order_notional_jpy: 500000
+max_daily_order_notional_jpy: 500000
+max_position_quantity_per_symbol: 100
+max_position_notional_jpy_per_symbol: 500000
+max_gross_cash_position_notional_jpy: 500000
+max_total_unrealized_loss_jpy: 100000
+max_open_orders: 1
+max_intent_age_seconds: 60
+max_future_intent_skew_seconds: 5
+max_preflight_duration_seconds: 15
+max_reconciliation_match_seconds: 30
+max_quote_age_seconds: 30
+max_price_deviation_bps: 50
+timeout_seconds: 5

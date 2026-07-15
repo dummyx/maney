@@ -7,6 +7,7 @@ from typing import Annotated, Any
 import typer
 
 from nlp_trader import pipeline
+from nlp_trader.broker.cli import broker_app
 from nlp_trader.config import ResearchConfig, RuntimeConfig, TransformerConfig, load_config
 from nlp_trader.data.synthetic import generate_synthetic_fixture
 from nlp_trader.logging import configure_logging
@@ -51,10 +52,11 @@ PipelineCommand = Callable[[ResearchConfig], dict[str, Any]]
 
 app = typer.Typer(
     name="nlp-trader",
-    help="Local-first, research-only market and natural-language strategy pipeline.",
+    help="Local-first research pipeline with separately gated broker operations.",
     add_completion=False,
     no_args_is_help=True,
 )
+app.add_typer(broker_app, name="broker")
 
 
 @app.callback()
