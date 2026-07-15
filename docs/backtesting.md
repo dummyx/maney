@@ -10,14 +10,21 @@ artifact locations are indexed in [Outputs](outputs.md).
 
 ## Replay and fills
 
-Each decision occurs after a complete daily bar at the official exchange close. Candidates
-are ranked by absolute model score. Positive scores request a long position; negative scores request
-a short only when shorting is enabled. The portfolio layer applies eligibility and risk limits before
-any return is realized.
+Each decision occurs only after a complete daily bar and every required input in the session
+cross-section is available. For generic close-available bars this is the official exchange close;
+for a delayed bar it is later. Positive scores request a long position; negative scores request a
+short only when shorting is enabled. After this
+direction eligibility check, candidates are ranked by absolute model score with `asset_id` as the
+deterministic tie-breaker, and `models.top_k` caps the selected model-scored candidates. Backtest and
+paper paths pass that value to the same portfolio constructor, so they select the same constrained
+portfolio from the same cross-section. The equal-weight and no-trade reference paths are not capped
+this way. The portfolio layer applies the remaining eligibility and risk limits before any return is
+realized.
 
 Every replay period is an independent round trip that starts flat:
 
-1. Enter constrained targets at the raw tradable `open` of the exact next XNYS session.
+1. Enter constrained targets at the raw tradable `open` of the first configured-exchange session
+   strictly after the decision timestamp.
 2. Apply the label return through the exact configured horizon session. That return compares the raw
    entry open and raw exit close after multiplying each by its bar's causal
    `return_adjustment_factor`.
@@ -33,6 +40,14 @@ weight changes into participation estimates; performance is reported as normaliz
 The recorded raw open and close prices are assumed full fills. This is not an opening/closing auction
 or venue simulator: there is no order book, queue priority, partial-fill path, intraday path, latency
 race, tax model, or guarantee that a target-weight fill was achievable.
+
+For `japan_cash_equity_v1`, source `ts` remains the official XJPX close while `available_at` records
+the later-or-equal delivery time. The cross-section decision waits for the latest required
+availability. A payload delayed past the next XJPX open therefore rolls entry forward; the replay
+does not backdate it to the bar close. See [Japan cash-equity baseline](japan_baseline.md).
+The generated label is not admitted to training at its exit close: `label_available_at` is the
+latest availability across the required exit-session bar cross-section, and training cutoffs are
+exclusive.
 
 ## Enforced constraints
 
@@ -55,6 +70,14 @@ The portfolio constructor enforces:
   checked against the full cap
 - minimum price and dollar volume
 - shorting permission, short availability, and hard-to-borrow permission
+
+`short_available` and `hard_to_borrow` can be supplied on each asset-master record. The local provider
+validates them, silver asset output retains them, feature and prediction rows carry them forward, and
+both backtest and paper portfolio construction enforce them. Missing short availability defaults to
+false; when a record is explicitly shortable but omits hard-to-borrow status, that status defaults to
+true. These are static asset-master fields, not a dated locate or borrow-inventory feed; historical
+research is responsible for supplying a point-in-time-valid asset master rather than using present-day
+availability retrospectively.
 
 When a request breaches an exposure limit, weights are scaled deterministically. The participation
 cap reduces an individual entry delta using information available at the decision. Replay recomputes
@@ -103,13 +126,40 @@ updated with future full-session volume, but it is still a daily-bar approximati
 observed auction book. Missing or inaccurate market microstructure inputs make the resulting costs
 unreliable.
 
-The bundled configs are long-only and the pipeline currently marks short availability false. Borrow
-cost code exists for properly supplied short data, but the sample does not validate a short strategy.
+The bundled configs are long-only, and bundled inputs without explicit asset-master borrow fields
+default short availability to false. Borrow-cost code and the end-to-end availability path exist for
+properly supplied data, but the sample does not validate a short strategy.
+
+## Paper intents and evidence
+
+The pipeline `paper` stage applies the same `models.top_k` selection and portfolio constraints to the
+latest combined-model cross-section, then emits pending, unfilled next-session-open intents. It does
+not fill them or mutate cash, equity, trades, or positions. `snapshot.json` is the convenient current
+view; the accompanying append-only `events.jsonl` is the audit evidence described in
+[Outputs](outputs.md). Both retain the config hash, horizon, `top_k`, same-day buffer, and exact
+effective entry-constraint snapshot needed to reconstruct why an intent was clipped.
+
+Paper ledger events require a timezone-aware `asof_ts`, a `paper_` event type, and
+`simulation_only=true`. Each canonical JSON event receives a contiguous sequence number, the prior
+event hash, and its own SHA-256 hash. Replay rejects duplicate JSON keys and noncanonical record
+encodings, then validates timestamps, sequence order, complete JSONL records, hash links, and event
+hashes; detected tampering also prevents a later append. A `PaperSimulator` can optionally send its
+rebalance and mark-to-market events to the same ledger interface. It requires an empty ledger at
+construction and deliberately does not resume or infer simulator state from existing events.
+
+The ledger is a tamper-evident local record, not an authenticated signature or external timestamp.
+It is intentionally single-writer: it has no file lock or cross-process compare-and-swap. Serialize
+all writes to a given path; concurrent writers can race on sequence and previous-hash assignment.
 
 ## Baselines and reports
 
 The same replay is run for traditional-only, text-only, combined, equal-weight, momentum-only, and
 no-trade prediction families. This makes incremental text comparisons cost- and constraint-consistent.
+Development and configured final-holdout periods are replayed into separate artifacts and comparison
+files; the research note's primary backtest section is explicitly the development window. Development
+purges the contiguous suffix beginning with the first decision whose complete label cross-section is
+not available before the holdout boundary. That conservative suffix and the holdout replay retain the
+global multi-session rebalance phase instead of compressing gaps or restarting at the boundary.
 
 Reported diagnostics include:
 
@@ -150,15 +200,19 @@ drawdown, turnover, exposure, and costs alongside annualized statistics.
 - The next-open entry and horizon-close liquidation use observed raw tradable bar prices as assumed
   full fills; opening/closing auction mechanics are not simulated. Corporate-action continuity is in
   the factor-adjusted return, not a rewritten fill price.
-- Open and intraday strategy decisions are unsupported. The existing next-open entry follows a prior
-  close decision and does not make daily OHLC features known early.
+- Open and intraday strategy decisions are unsupported. The existing later-open entry follows a
+  completed daily-data decision and does not make daily OHLC features known early.
 - Venue queues, partial fills beyond the participation cap, latency, and intraday liquidity paths are
   not modeled.
 - Market impact and spread are proxies rather than calibrated quote/fill models.
-- Forced locate recalls and dynamic borrow availability are not modeled.
+- Forced locate recalls and dynamic borrow availability are not modeled; current asset-master
+  availability flags are static unless the user supplies separate point-in-time-correct runs.
 - Every supplied OHLC bar must set `corporate_action_adjusted=true`, supply a positive causal
-  `return_adjustment_factor`, and show `adjustment_vintage_at <= ts`. Returns compare raw prices after
-  applying their respective factors, while fills and liquidity retain raw tradable prices. Optional
+  `return_adjustment_factor`, and prove that its adjustment vintage was available by the decision.
+  Generic close-available bars require `adjustment_vintage_at <= ts`; a bar with explicit
+  `available_at` permits a later vintage only through that availability timestamp. Returns compare
+  raw prices after applying their respective factors, while fills and liquidity retain raw tradable
+  prices. Optional
   corporate-action event records add point-in-time event features but do not alter prices or factors;
   provider-specific revision and action histories remain the user's responsibility.
 - Capacity beyond the configured participation and impact proxies is not established.

@@ -3,7 +3,7 @@
 This page explains what each CLI command does, which prerequisites it runs, and which files it
 produces.
 
-## Two command categories
+## Three command categories
 
 These commands do not create a research run:
 
@@ -12,24 +12,27 @@ These commands do not create a research run:
 | `validate-config` | Validate the typed YAML and required local paths. |
 | `generate-synthetic` | Create deterministic asset, market, and text fixture files. |
 
-Every other command is a pipeline execution command. It validates first, creates a new immutable
-`run_id`, executes its dependency graph, and writes either `run.final.json` or `run.failed.json`.
-There is no resume-in-place behavior.
+Pipeline execution commands validate first, create a new immutable `run_id`, execute their dependency
+graph, and write either `run.final.json` or `run.failed.json`. There is no resume-in-place behavior.
+
+The third category is the standalone `nlp-trader broker ...` command group. It uses a separate broker
+config and audit ledger, creates no research run, and is never invoked by a pipeline or paper command.
+See [Broker integration](broker.md).
 
 ## Stage dependency graph
 
-```text
-ingest-market ─────┬──────────────> build-labels ──┐
-                  │                                │
-                  └──> build-features <── ingest-text
-                              │                    │
-                              └────────> train <───┘
-                                           │
-                                        predict
-                                       /       \
-                                  backtest     paper
-                                     │
-                                   report
+```mermaid
+flowchart TD
+    market["ingest-market"] --> annotate["annotate-text"]
+    text["ingest-text"] --> annotate
+    market --> labels["build-labels"]
+    annotate --> features["build-features"]
+    labels --> train
+    features --> train
+    train --> predict
+    predict --> backtest
+    predict --> paper
+    backtest --> report
 ```
 
 `smoke` is an alias for running through `report`. The `paper` branch is separate from `report` and
@@ -41,12 +44,13 @@ the backtest.
 |---|---|---|
 | `ingest-market` | none | Bronze references and silver assets, bars, and configured optional records |
 | `ingest-text` | loads/captures the filtered asset master internally | Bronze references and normalized silver text |
-| `build-features` | market + text ingestion | Silver text signals and gold feature table |
+| `annotate-text` | market + text ingestion | Optional validated generative sidecars, provenance, and summary; no output when disabled |
+| `build-features` | text annotation stage | Silver text signals and gold feature table |
 | `build-labels` | market ingestion | Gold label table |
 | `train` | features + labels | Versioned model artifact |
 | `predict` | training | Predictions and model-evaluation JSON |
-| `backtest` | prediction | Per-family replay JSON and comparison metrics |
-| `paper` | prediction | Latest pending simulation-only intent snapshot |
+| `backtest` | prediction | Separate development/final-holdout per-family replays and comparisons |
+| `paper` | prediction | Latest pending simulation-only intent snapshot plus hash-chained event evidence |
 | `report` | backtest | Markdown research note |
 | `smoke` | same path as `report` | Smallest complete end-to-end run |
 
@@ -82,7 +86,8 @@ The overrides become part of the immutable typed config and therefore affect the
 
 ### Dates
 
-Dates bound emitted close-decision rows. They do not simply slice every source at the same points.
+Dates bound emitted `asof_ts` decision rows. They do not simply slice every source at the same
+points. For a delayed daily-bar feed, `asof_ts` can follow the official source-bar close.
 The pipeline adds:
 
 - market-session warm-up before the requested start;
@@ -143,6 +148,23 @@ uv run nlp-trader backtest \
 Start small, inspect the manifest and feature counts, then widen the period. Full mode currently
 materializes downstream working sets in memory.
 
+### Strict Japanese cash-equity baseline
+
+Prepare permitted local files first; the repository includes no J-Quants payload or downloader.
+The template intentionally fails path validation until those files exist:
+
+```bash
+uv run nlp-trader validate-config --config configs/japan_baseline.yaml
+uv run nlp-trader ingest-market --config configs/japan_baseline.yaml
+uv run nlp-trader backtest --config configs/japan_baseline.yaml --limit 320
+```
+
+The XJPX contract separates the official session-close `ts` from the exact payload's later
+`available_at`, uses raw prices for hypothetical fills, and chooses the first exchange open strictly
+after the safe decision timestamp. Follow [Japan cash-equity baseline](japan_baseline.md) before
+normalizing an export. A completed run is a data-contract and implementation result, not evidence of
+profitability.
+
 ### Generate paper intents
 
 ```bash
@@ -152,15 +174,31 @@ uv run nlp-trader paper --config configs/sample.yaml
 The CLI paper stage:
 
 - looks at the latest combined-model decision;
-- marks up to `models.top_k` positive-score assets as selected;
-- emits one `BUY` or `FLAT` intent for every asset in the latest cross-section;
+- uses the same absolute-score `models.top_k` portfolio selection as the combined-model backtest,
+  including eligible shorts when explicitly enabled and available;
+- emits one `BUY`, `SHORT`, or `FLAT` intent for every asset in the latest cross-section;
 - applies portfolio constraints to selected target weights; and
-- writes empty `positions` and `trades` with unchanged initial `equity`.
+- writes empty `positions` and `trades` with unchanged initial `equity`, plus a hash-chained
+  `paper_intent_batch` evidence event.
 
 It does not fill anything, charge costs, maintain account state, or connect to a broker. The separate
 `PaperSimulator` class is an in-memory programmatic utility for simulated rebalances and
-mark-to-market events from caller-supplied returns; it also has no broker adapter or price-level fill
-model.
+mark-to-market events from caller-supplied returns; it never invokes the standalone broker adapter
+and has no price-level fill model.
+
+### Operate the standalone kabuS adapter
+
+```bash
+uv run nlp-trader broker --help
+```
+
+Broker commands are independent from the dependency graph above and accept only the broker's strict,
+operator-prepared limit-order document with an explicit expiry—not predictions, backtest trades, or
+paper intents. Authenticated commands run only on the same Windows PC as kabuStation. Validation
+returns fixed test responses and does not model realistic account state; production can place real
+orders. Every config and environment shares fixed current-user audit, kill-switch, and operation-lock
+state. Follow the preview/confirmation ceremonies, ambiguity policy, and private single-user
+requirements in [Broker integration](broker.md).
 
 ### Optional local transformer sentiment
 
@@ -175,12 +213,50 @@ Set `transformer.model_name` to a model already present locally first. Keep
 `transformer.local_files_only: true` for an offline, reproducible run. Outputs are cached by normalized
 text/model identity.
 
+### Optional local generative entity/event annotation
+
+First edit a copied config: set `paths.llm_model` to an immutable local model directory, fill the
+model ID/revision/license fields, and enable annotation. Keep feature application off for the first
+review run:
+
+```yaml
+paths:
+  llm_model: /absolute/path/to/immutable/local-model
+llm_annotations:
+  enabled: true
+  apply_to_features: false
+  model_id: local-model-id
+  model_revision: exact-local-revision
+  model_license_or_terms_ref: local-license-record
+```
+
+Then generate and inspect only the sidecars:
+
+```bash
+uv sync --extra nlp
+uv run nlp-trader annotate-text --config configs/local.yaml
+```
+
+`annotate-text` runs both ingestion prerequisites. `build-features` and every downstream stage also
+run it automatically because it is a dependency. With `enabled: false`, the stage is a no-op and the
+deterministic sample output is unchanged. With sidecar mode above, validated annotations, raw local
+responses, prompt/schema/provenance, and a summary are written, but text signals and features remain
+deterministic.
+
+After reviewing task-level accuracy and freezing the model, prompt, schema, and decoding settings,
+set `apply_to_features: true` in a new versioned config and run a matched experiment. Valid
+non-abstained results replace only the corresponding entity’s sentiment/event fields; abstentions
+fall back to the deterministic values. The component uses no external retrieval, future context,
+prices, labels, return forecasts, or order generation. The shared cache is keyed by exact input,
+candidate, model-directory, prompt/schema, and decoding identity.
+
 ## Model selection details
 
-`models.top_k` controls precision-at-k evaluation and latest paper-intent selection. It does not cap
-the number of backtest candidates. The current portfolio constructor requests every positive score
-for long-only runs and every negative score as well when shorting is enabled, then applies eligibility,
-exposure, turnover, and participation constraints.
+`models.top_k` sets the depth of the long-side precision-at-k diagnostic and caps the candidate set
+for traditional, text, combined, and momentum backtests plus latest combined paper intents. The
+portfolio path applies direction eligibility before absolute-score ranking; that selection is
+deliberately distinct from raw-score-descending precision-at-k. Exposure, turnover, and participation
+constraints follow. Equal-weight and no-trade reference paths remain uncapped.
 
 ## Validation and failures
 

@@ -66,9 +66,11 @@ uv run nlp-trader smoke --config configs/sample.yaml
 
 The [GitHub Actions quality workflow](../.github/workflows/quality.yml) applies these gates on every
 push and pull request. Ubuntu runs formatting, lint, strict type checks, the full test suite, and the
-sample smoke. A macOS arm64 runner repeats the baseline tests and sample. Both jobs sync the exact
-lockfile before switching uv to offline, no-sync execution, which separates dependency installation
-from the no-dependency-access checks. This is not an operating-system-level network sandbox.
+sample smoke. A macOS arm64 runner repeats the baseline tests and sample. A Windows runner executes
+the broker boundary tests and validates the bundled non-secret broker config. All three jobs sync
+the exact lockfile before switching uv to offline, no-sync execution, which separates dependency
+installation from the no-dependency-access checks. This is not an operating-system-level network
+sandbox.
 
 The macOS job verifies the baseline on Apple Silicon. It deliberately omits the optional `nlp`
 extra, so it does not claim that PyTorch or MPS inference was exercised.

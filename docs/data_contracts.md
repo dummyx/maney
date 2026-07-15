@@ -28,19 +28,26 @@ examples in supplier-friendly form.
 - `processed_at`: when a derived representation was produced, when recorded.
 - `available_at`: the earliest defensible time the strategy could have used the information.
 - `asof_ts`: the strategy decision timestamp to which a signal or feature belongs.
-- `label_start_ts`: the exact next XNYS session open used as the entry timestamp.
-- `label_end_ts`: the exact configured-horizon XNYS session close used as the exit timestamp.
+- `label_start_ts`: the first configured-exchange session open strictly after `asof_ts`, used as the
+  entry timestamp.
+- `label_end_ts`: the exact configured-horizon exchange-session close used as the exit timestamp.
+- `label_available_at`: when the complete outcome cross-section became observable. Generated labels
+  set this to the latest required future bar availability, not merely `label_end_ts`. For external or
+  legacy labels where it is absent, a generic `available_at` takes precedence over `label_end_ts`.
 
-Modeling uses `available_at`, not `published_at`. The pipeline supports close decisions only: the
-decision is made after the full daily OHLC bar is complete. An item available by an official
-XNYS close is assigned to that close, while a later item moves to the next session close. The
-versioned exchange calendar handles holidays, exceptional closures, early closes, and daylight-
-saving transitions. Calendar requests outside explicit bounds fail. A next-session-open fill is a
-future execution assumption, not evidence that the closing feature row was available at the open.
+Modeling uses `available_at`, not `published_at`. The pipeline supports completed daily-bar decisions
+only. Under the generic contract, a bar without separate availability metadata is treated as
+available at its official close. Under `japan_cash_equity_v1`, the bar keeps that close as `ts` but
+must supply its later-or-equal `available_at`; a complete session cross-section cannot be decided
+before its latest required availability. The versioned XNYS/XJPX calendar handles holidays,
+exceptional closures, early closes, and venue close changes. Calendar requests outside explicit
+bounds fail. Entry is the first official open strictly after the decision, so data delayed past an
+open rolls to a later session rather than being backdated.
 
 Runtime `start_date` and `end_date` are inclusive filters on `asof_ts`. A date-only start resolves to
-the beginning of that UTC date and a date-only end to its end; the actual rows are still official XNYS
-close timestamps. The fetch interval expands backward by `market_warmup_sessions` exchange sessions
+the beginning of that UTC date and a date-only end to its end; actual rows use the safe decision
+timestamp, which may be later than the source bar close. The fetch interval expands backward by
+`market_warmup_sessions` exchange sessions
 and `text_warmup_days` calendar days, and forward by `horizon_days` exchange sessions. Context is
 available to builders and silver storage, but only decision rows inside the requested interval enter
 gold outputs.
@@ -59,16 +66,23 @@ feature store reject future provenance or duplicate canonical keys.
 
 ## Core records
 
-- `Asset`: stable asset ID, symbol, exchange, currency, name, sector/industry, active interval, and
-  optional CIK/FIGI/ISIN identifiers.
+- `Asset`: stable asset ID, symbol, exchange, currency, name, sector/industry, active interval,
+  optional CIK/FIGI/ISIN identifiers, and conservative short-availability/hard-to-borrow flags.
 - `MarketBar`: asset, UTC official-close timestamp, raw tradable daily OHLCV, optional VWAP/adjusted
   close, and explicit causal return-adjustment metadata. The daily feature/label path requires
-  `corporate_action_adjusted=true`, timezone-aware `adjustment_vintage_at <= ts`, and a positive
-  `return_adjustment_factor` for every row. Return features and label outcomes compare
+  `corporate_action_adjusted=true`, a timezone-aware causal adjustment vintage, and a positive
+  `return_adjustment_factor` for every row. Without separate bar availability, the vintage cannot
+  follow `ts`; when `available_at` is present, it cannot follow that timestamp. Return features and
+  label outcomes compare
   `raw_price * return_adjustment_factor`; raw open/close remain the execution and trade-log prices,
   and raw price times volume remains the liquidity basis. The flag certifies that the adjustment
   metadata is complete; it does not mean the raw OHLC fields are rewritten. `adjusted_close` does
   not substitute for the required per-bar factor.
+
+The Japanese cash-equity specialization additionally requires XJPX/JPY identity, canonical security
+codes, explicit trading units and session dates, `price_basis=raw_tradable`, and
+`ts <= adjustment_vintage_at <= available_at`. Its field-level and J-Quants V2 normalization
+contract is documented in [Japan cash-equity baseline](japan_baseline.md).
 - `TextItem`: source/type/language, permitted text or raw hash/path, publication/vendor/ingestion/
   availability timestamps, SHA-256 author/URL identifiers, entities, event fields, relationship type,
   hashed parent item, content status, retention permission, and terms reference.
@@ -100,12 +114,23 @@ silently deduplicated. Text duplication is different: items are ordered by
 only prior documents and a bounded candidate set. A later bridge item never merges two historical
 clusters.
 
+Baseline-facing text counts, sentiment, event, source, velocity, and abnormal-attention features use
+only the novelty-filtered independent evidence window. Raw repetition remains observable under
+explicit `raw_*` diagnostics plus novelty/duplicate counts; `raw_*` fields are excluded from baseline
+feature discovery.
+
 Asset references are checked against the asset master. Market bars and supplied text entities with
 an `asset_id` must match the canonical symbol and fall within the asset's exchange-local
 `active_from`/`active_to` interval. A text entity without `asset_id` cannot emit a signal; a nonempty
 supplied entity list also prevents automatic relinking. Optional point-in-time records are checked
 for asset ID and symbol consistency; their feature use is still gated by the decision bar and their
 own period/event and availability fields.
+
+Between the first and last supplied market session, every asset active on a session must have a bar.
+This whole-universe check prevents a missing bar from silently changing market/sector context or the
+investable cross-section. Training and evaluation apply the same principle to outcomes: a complete
+decision-and-horizon cross-section is included, a partial one fails, and a wholly censored group is
+omitted only when every expected label end is beyond the final decision boundary.
 
 ## Bronze: immutable source bytes
 
@@ -136,6 +161,7 @@ Silver data is typed, normalized, and partitioned for pruning:
 ```text
 silver/market/bar_size=1d/symbol=AAPL/year=2026/part-*.parquet
 silver/text/source=news/date=2026-07-09/part-*.parquet
+silver/llm_annotations/symbol=AAPL/year=2026/part-*.parquet
 silver/text_signals/symbol=AAPL/year=2026/part-*.parquet
 silver/fundamentals/symbol=AAPL/year=2026/part-*.parquet
 silver/earnings_calendar/symbol=AAPL/year=2026/part-*.parquet
@@ -150,11 +176,29 @@ item IDs before silver materialization; supplied hash fields must be lowercase S
 `active`, `deleted`, `private`, `protected`, or `unknown`. A record explicitly marked
 `retention_permitted=false` is rejected.
 
+Optional generative annotations are sidecar records keyed by `(item_id, asset_id)`. Raw model output
+must be one strict JSON object whose only top-level field is `annotations`. Each valid per-asset
+record contains a closed-set stance label and confidence, uncertainty, at most one closed-set primary
+event and confidence, source evidence span IDs, and an explicit abstention reason when applicable.
+The host, not the model, derives the numeric sentiment score and supplies item, asset, timestamp, and
+provenance identity. Unknown/duplicate/missing assets, unrecognized labels/events, non-finite or
+out-of-range values, and unknown or duplicate evidence IDs fail validation. Malformed model output
+fails the whole uncached generation batch before annotation-cache or annotation-artifact writes
+rather than being silently repaired.
+
+Annotation availability never overrides source availability: every applied annotation retains the
+source `available_at`, and feature construction still enforces `available_at <= asof_ts`. Generated
+text is not accepted as factual input. When feature application is disabled, annotations remain
+sidecars and cannot change gold features; when it is explicitly enabled, only valid, non-abstained
+entity stance/event fields replace their deterministic counterparts. Deterministic linking,
+relevance, novelty/deduplication, credibility, spam, source, and availability fields remain intact.
+
 ## Gold: features, labels, and predictions
 
 Gold Parquet is partitioned by version/family and year. Feature and label generation are separate.
-For a close decision, a label records the raw tradable `open` of the exact next XNYS session and the
-raw tradable `close` of the exact `horizon_days` session as its execution prices. Its forward return
+For a completed-bar decision, a label records the raw tradable `open` of the first
+configured-exchange session strictly after `asof_ts` and the raw tradable `close` of the exact
+`horizon_days` session as its execution prices. Its forward return
 compares those prices after multiplying each by that bar's causal `return_adjustment_factor`, and
 records `price_basis=causal_return_adjustment_factor`. The bar series must contain contiguous
 official sessions; an internal missing or duplicate session is rejected. A trailing horizon that is
@@ -179,6 +223,8 @@ bars, and text items are required. Fundamentals, earnings calendar, and corporat
 optional. Each configured source must be an existing file or a nonempty Parquet directory. Input
 paths may not overlap any artifact root, and raw/interim/processed/model/report roots must be
 mutually non-overlapping. The system does not download, revise, adjust, or infer missing vendor data.
+When generative annotation is enabled, `paths.llm_model` must be a nonempty local model directory and
+must not overlap an artifact root.
 
 See [Outputs](outputs.md) for the materialized tree and [Research protocol](research_protocol.md) for
 the human review checklist.

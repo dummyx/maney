@@ -20,17 +20,18 @@ vendor, revision, corporate-action, or outcome knowledge.
 
 ## One decision timeline
 
-For the current daily pipeline:
+For the current daily pipeline, source availability may equal or follow the official close:
 
 ```text
-before/at XNYS close       after the close        next XNYS open       horizon XNYS close
----------------------|------------------------|--------------------|----------------------
-usable inputs arrive     feature/asof decision      assumed entry          assumed exit
-                                                    label starts           label ends
+official close        required data available     first later open      horizon close
+------------------|---------------------------|--------------------|------------------
+daily bar complete      feature/asof decision       assumed entry       assumed exit
+                                                    label starts        label ends
 ```
 
-An after-hours text item is not moved backward into the completed close. It becomes actionable at a
-later configured decision.
+An after-hours item or delayed daily bar is not moved backward into the completed close. It becomes
+actionable only at a later safe decision, and entry uses the first official exchange open strictly
+after that timestamp.
 
 ## Storage layers
 

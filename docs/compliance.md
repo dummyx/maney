@@ -15,9 +15,18 @@ request ID, ingestion time, payload hash, and fetch-parameter hash. These fields
 they do not grant rights. The user remains responsible for verifying the underlying license and any
 redistribution, deletion, or retention requirement.
 
-Full mode requires user-provided licensed local files. The repository supplies no paid text, real
-social corpus, account data, vendor credential, or external API adapter. Synthetic fixtures are
-clearly marked and may be regenerated without network access.
+Full mode requires user-provided licensed local files. The research pipeline supplies no paid text,
+real social corpus, account data, vendor credential, or external market-data adapter. The separate
+kabuS broker adapter accesses only operator-authorized account data when explicitly invoked.
+Synthetic fixtures are clearly marked and may be regenerated without network access.
+
+The strict Japanese baseline likewise accepts only a repository-owner-supplied permitted local
+export. A J-Quants subscription or API entitlement does not automatically grant redistribution
+rights. Verify the current terms for collection, local retention, transformation, derived outputs,
+and any required deletion before use; keep vendor payloads and bronze copies private and out of git.
+The config's `license_or_terms_ref` is an audit pointer, not permission. The repository contains no
+J-Quants credential, client, or dataset. See the [official J-Quants site](https://jpx-jquants.com/en)
+and the [Japan baseline preparation guide](japan_baseline.md).
 
 ## Social and natural-language data
 
@@ -38,15 +47,28 @@ clearly marked and may be regenerated without network access.
 - The bronze store preserves the original source file byte-for-byte. If that file contains raw
   identifiers or restricted text, hashing in silver does not remove it from bronze; keep the raw root
   private and ingest only data whose retention is permitted.
+- Optional generative prompts, raw responses, and caches can repeat licensed/private source text.
+  Keep them local and gitignored, apply the source’s retention/transformation terms, and record the
+  local model’s license or terms reference. Model access does not expand the rights granted by the
+  source license.
+
+The generative component is a constrained entity-stance/event parser. It receives no external RAG
+or web context, may cite only supplied source spans, and must abstain rather than invent missing
+facts. It is not authorized to predict returns, recommend trades, or generate orders. Historical
+source timestamps also do not eliminate knowledge embedded during model pretraining; reports must
+identify this as a retrospective-parser limitation unless the exact model is historically valid.
 
 ## Secrets and local artifacts
 
-The code reserves `NLP_TRADER_*` environment-backed secret settings for future external adapters, but
-the current local providers do not instantiate them or require credentials. Future adapters must read
-secrets only from environment variables or an ignored local `.env`, never from research configs.
-Secrets must not appear in snapshots, manifests, reports, logs, or exception messages. Never commit
-credentials, account IDs, raw vendor data, paid content, raw social data, generated models, caches,
-or reports.
+Local research providers require no credentials. The kabuS adapter reads its API password from
+`NLP_TRADER_KABUS_API_PASSWORD` or an ignored local `.env`, never from research or broker YAML. The
+returned token remains memory-only. Authenticated operations are restricted to the same Windows PC
+as kabuStation. Prefer a secure interactive PowerShell prompt over a literal assignment or command-
+line secret; an `.env` is plaintext and requires a current-user ACL. Secrets must not appear in
+snapshots, manifests, audit records, reports, logs, exception messages, or shell history. Never
+commit credentials, account IDs, operator-modified broker configs or intents, raw vendor data, paid
+content, raw social data, generated models, caches, or reports. The bundled validation config
+contains no secret. See [Broker integration](broker.md).
 
 The bundled raw, interim, processed, model, and report roots are gitignored. If you configure roots
 elsewhere, keep them out of version control too. Bronze ingestion is append-only and
@@ -56,19 +78,29 @@ records.
 ## Research, paper, and live boundaries
 
 - Research stages create features, labels, models, predictions, hypothetical backtests, and reports.
-- `paper` converts the latest combined-model close decision into constrained, simulation-only pending
+- `paper` converts the latest combined-model daily decision into constrained, simulation-only pending
   next-session-open intents. The snapshot has `status: pending_unfilled_intents`, unchanged initial
   capital/equity, empty positions, and no trades. It records no fill, cost, cash balance, position
   mutation, or automatic horizon-close liquidation, and has no broker credentials, network client,
   external account state, or order-routing adapter.
 - `OrderIntent` and `PaperOrderIntent` are target-weight research records, not executable orders.
-- No code path in this repository places or transmits a live order.
+- No research, backtest, report, or paper code path places or transmits a live order or converts its
+  output into one.
+- Only the standalone `nlp-trader broker ...` group can contact kabuStation. It accepts a separately
+  prepared strict cash-order document and requires explicit operator confirmations; production can
+  transmit real orders.
 
-Live execution must not be added as an incidental extension of paper simulation. A dedicated future
-task would require broker sandboxing, explicit approval gates, kill switches, position and loss
-limits, credential isolation, idempotent order handling, reconciliation, audit logs, operational
-monitoring, and separate user confirmation. Until that design and approval exist, all output remains
-research or paper simulation.
+The kabuS integration is scoped to a private, single-user installation where the account holder owns
+and controls the resulting program and is its sole operator. Codex-assisted development does not, by
+itself, change that engineering assumption; no other person may use or operate the program or its
+API access, and credentials and account data remain private. This does not assert that source-code
+distribution is prohibited. The operator remains responsible for confirming that their own use
+complies with the provider's current service rules; this project does not make a legal
+determination. The adapter must run on the same
+Windows PC as kabuStation. Its validation endpoint returns fixed test values and cannot place a real
+order, while production can move real money. Local limits, confirmations, the kill switch,
+reconciliation, and audit evidence reduce operational risk but do not guarantee correctness or
+prevent loss. Read [Broker integration](broker.md) before enabling it.
 
 ## Reporting language
 
@@ -79,6 +111,6 @@ size. Preserve negative experiments and disclose missing point-in-time, survivor
 action return-factor provenance, bounded event context, and execution data.
 
 For operational details, see [Input data](input_data.md), [Research protocol](research_protocol.md),
-and [Backtesting](backtesting.md).
+[Backtesting](backtesting.md), and [Broker integration](broker.md).
 
 Return to the [documentation home](README.md).

@@ -6,6 +6,10 @@ Start with configuration validation:
 uv run nlp-trader validate-config --config <your-config.yaml>
 ```
 
+That command is for research configs. For a standalone broker config, use
+`uv run nlp-trader broker validate-config --config <broker.yaml>` and see
+[Broker integration](broker.md).
+
 If validation succeeds but a stage fails, use the printed `run_id`, stage logs, and
 `reports.../<run_id>/run.failed.json`. Its `failed_stage` is the requested target, not necessarily the
 dependency where the exception arose; the final `stage_start` log identifies that dependency.
@@ -150,22 +154,26 @@ Daily feature/label runs require:
 
 ```text
 corporate_action_adjusted = true
-adjustment_vintage_at <= ts
+adjustment_vintage_at <= available_at (when bar availability is explicit)
 return_adjustment_factor > 0
 ```
 
 Raw OHLC remains unadjusted for fills. Do not substitute a modern adjusted-close column for the
-causal factor/vintage contract.
+causal factor/vintage contract. For a generic bar without explicit `available_at`, the adjustment
+vintage must not follow `ts`. The Japanese contract instead requires
+`ts <= adjustment_vintage_at <= available_at` because delivery normally follows the close.
 
 ### Bar is not at the official close
 
-`ts` must be the configured calendar’s actual session close, including early closes and DST shifts.
-Do not hardcode `20:00Z` for every date.
+`ts` must be the configured calendar’s actual session close, including early closes, DST shifts,
+and venue close-time changes. Do not hardcode one UTC close for every date. `available_at` is a
+separate delivery timestamp and must not replace `ts`.
 
 ### Missing or duplicate internal session
 
 Supply one unique bar per expected exchange session for each asset over its covered range. The
-builder does not invent a missing weekday or silently drop duplicates.
+builder also requires every asset active between the first and last supplied session to appear in
+that session's cross-section; it does not invent a bar or silently shrink the universe.
 
 ### Trailing label is missing
 
@@ -174,9 +182,9 @@ loads this context automatically only when those bars exist in the input.
 
 ### Partial cross-sectional labels
 
-The backtest refuses a decision where only some predicted assets later have outcomes. Fix the input
-coverage or explicitly end the requested decision interval earlier. It will not choose surviving
-assets based on future label availability.
+Training, evaluation, and backtesting refuse a decision where only some candidate assets later have
+outcomes. Fix the input coverage or explicitly end the requested decision interval earlier. The
+pipeline will not choose surviving assets based on future label availability.
 
 ## Model and result surprises
 
@@ -187,8 +195,15 @@ the walk-forward cutoff. Embargoes delay fitting further.
 
 ### Backtest trades more than `top_k`
 
-`models.top_k` controls precision-at-k and paper selection, not the backtest candidate count. The
-backtest sends all signed nonzero scores through portfolio constraints.
+Model-scored paths select at most `top_k` positions per decision, but each selected round trip can
+produce both an entry and a forced-exit trade row. Equal-weight is intentionally uncapped. Count
+distinct entry assets per period when checking selection depth.
+
+### Final holdout leaves no development period
+
+Reduce `models.final_holdout_periods` or widen the decision range. The value counts fully observed
+whole cross-sections and must leave at least one development period. Do not solve this by partially
+dropping assets or by moving missing future outcomes into the development window.
 
 ### No trades despite nonzero scores
 
@@ -228,6 +243,31 @@ path. Tests deliberately do not download models.
 
 The centralized device helper falls back to CPU. This is supported behavior, not an error.
 
+## Broker problems
+
+### Cannot connect to kabuStation or responses look artificial
+
+Run the broker command and kabuStation on the same Windows PC, keep kabuStation logged in, and do not
+proxy or expose its loopback API. The validation environment intentionally returns fixed test values
+and cannot place real orders; it is not a realistic account or fill simulator. Production uses a
+different loopback endpoint and can place real orders. Do not switch environments merely to bypass a
+failed validation preflight; follow [Broker integration](broker.md).
+
+### Cannot find the broker audit ledger
+
+Broker commands do not write into a research run or `paper/events.jsonl`. Run `broker
+validate-config` to display the fixed current-user `audit.jsonl`, `KILL_SWITCH`, and `operation.lock`
+paths. On Windows they are under `%LOCALAPPDATA%\nlp-trader\kabus`; changing config files does not
+change or reset them. Consult [Broker integration](broker.md) before reconciling or resolving an
+ambiguous mutation, and never edit or truncate the ledger by hand.
+
+### `operation.lock` still exists after the command
+
+This is normal. The file is stable and must never be deleted. The operating system lock on its open
+descriptor provides exclusivity and is released on normal close or process exit. If a command
+reports lock contention, find the other running broker process; deleting the file can create a
+second lock domain and permit unsafe concurrent operations.
+
 ## Performance and artifact problems
 
 ### Full run uses too much memory
@@ -266,7 +306,7 @@ Collect:
 - relevant schema/header names, without restricted data or credentials; and
 - the Python/`uv` versions.
 
-Then compare against [Input data](input_data.md), [Configuration](configuration.md), and
-[Data contracts](data_contracts.md).
+Then compare against [Input data](input_data.md), [Configuration](configuration.md),
+[Data contracts](data_contracts.md), and, for broker commands, [Broker integration](broker.md).
 
 Return to the [documentation home](README.md).

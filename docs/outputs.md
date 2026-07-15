@@ -32,10 +32,13 @@ runs without being copied into every run directory.
 | What config actually ran? | `reports.../<run_id>/config.snapshot.json` |
 | What should a human read? | `reports.../<run_id>/research_note.md` |
 | Which captured source inputs and per-run outputs were used? | Final manifest and bronze-reference JSON |
+| What did the optional generative parser return? | `processed.../<run_id>/silver/llm_annotations/`, its evaluation summary, and per-run prompt/schema/provenance/response records |
 | How did model families compare? | `processed.../<run_id>/evaluation/backtest_comparison.json` |
 | How good were predictions? | `processed.../<run_id>/evaluation/prediction_metrics.json` |
 | Which trades, costs, and constraints occurred? | `processed.../<run_id>/backtests/<family>/backtest.json` |
-| How many rows trained each snapshot? | `model.json` snapshot counts and training-key digest; exact keys are not stored by default |
+| Which paper intents were emitted, and is their evidence chain valid? | `processed.../<run_id>/paper/snapshot.json` and `paper/events.jsonl` |
+| Where are standalone broker actions audited? | Current-user kabuS state `audit.jsonl`; this is outside research run artifacts and paper evidence |
+| How many rows trained each snapshot? | `model.json` snapshot counts, role, and training-key digest; its final-holdout protocol records the frozen boundary/cutoff, while exact keys are not stored by default |
 | Why did a run fail? | `reports.../<run_id>/run.failed.json` plus stage logs |
 
 ## Full layout
@@ -57,21 +60,31 @@ runs without being copied into every run directory.
   silver/corporate_actions/symbol=<symbol>/year=<year>/part-*.parquet
 
 <processed root>/<run_id>/
+  silver/llm_annotations/symbol=<symbol>/year=<year>/part-*.parquet
   silver/text_signals/symbol=<symbol>/year=<year>/part-*.parquet
   gold/features/feature_set_version=<version>/year=<year>/part-*.parquet
   gold/labels/label_version=<version>/year=<year>/part-*.parquet
   gold/predictions/model_family=<family>/year=<year>/part-*.parquet
   evaluation/prediction_metrics.json
+  evaluation/llm_annotation_summary.json
   evaluation/backtest_comparison.json
+  evaluation/final_holdout_backtest_comparison.json
   backtests/<family>/backtest.json
+  backtests/<family>/final_holdout.json
   paper/snapshot.json
+  paper/events.jsonl
 
 <models root>/<run_id>/
+  llm_annotations/prompt.txt
+  llm_annotations/schema.json
+  llm_annotations/provenance.json
+  llm_annotations/responses/<cache-key>.json
   model_version=<version>/model.json
   model_version=<version>/metadata.json
   model_version=<version>/metrics/*.json
 
 <models root>/_cache/transformer/*.json       # optional shared inference cache
+<models root>/_cache/llm_annotations/*.json  # optional content-addressed generation cache
 
 <reports root>/<run_id>/
   config.snapshot.json
@@ -82,6 +95,22 @@ runs without being copied into every run directory.
 
 Not every stage produces every path. For example, `build-features` stops before labels/models, and
 the `paper` and `report` branches write different final products.
+
+The broker adapter does not write into this per-run layout. Its append-only `audit.jsonl` lives in
+fixed current-user kabuS state: `%LOCALAPPDATA%\nlp-trader\kabus` on Windows,
+`~/Library/Application Support/nlp-trader/kabus` on macOS, or the platform's XDG state location on
+Linux. The ledger is shared by all broker configs and environments, distinct from
+`paper/events.jsonl`, and not covered by a research run manifest. Keep it private and follow the
+retention and verification guidance in [Broker integration](broker.md).
+
+Silver asset rows preserve asset-master `short_available` and `hard_to_borrow` values. The gold
+feature rows and their derived prediction rows carry those values into backtest and paper portfolio
+eligibility. Missing short availability is written as `false`; a shortable record with missing
+hard-to-borrow status is written as `true`. These flags are not a historical borrow-inventory series.
+
+Gold label rows separate `label_end_ts`, the official outcome close, from `label_available_at`, the
+latest required exit-session bar availability across the complete cross-section. Walk-forward
+training uses the latter with an exclusive cutoff.
 
 ## Manifests
 
@@ -113,8 +142,27 @@ The artifact manifest covers per-run interim, processed, model, and report artif
 final manifest itself. Raw payload provenance is represented through the input and bronze-reference
 records. An optional transformer model’s weights and the shared transformer cache sit outside the
 per-run roots and are not hashed by the current input or artifact manifest. The config records the
-model name/version and inference settings, but exact model-byte provenance must be managed
+transformer name/version and inference settings, but exact model-byte provenance must be managed
 separately for transformer research.
+
+In contrast, an enabled generative annotator’s local model directory is hashed as a run input. Its
+logical ID, exact revision, license/terms reference, prompt and schema versions, decoding settings,
+and `retrospective_parser` status appear in annotation provenance. The shared cache is outside the
+run artifact roots, but every consumed raw response is copied to that run’s
+`models.../llm_annotations/responses/` directory and therefore enters the final artifact manifest.
+
+### Generative annotation artifacts
+
+`silver/llm_annotations/` contains validated sidecar rows keyed by `(item_id, asset_id)`, including
+stance/confidence, uncertainty, primary event/confidence, evidence span IDs, abstention information,
+source availability, and generation provenance. `evaluation/llm_annotation_summary.json` reports
+request, annotation, non-abstention, abstention, cited, event, and invalid-response counts plus the
+configured application mode; it is a processing summary, not a performance or profitability metric.
+
+`prompt.txt` and `schema.json` freeze the exact instruction/output contracts. `provenance.json`
+records model/config/cache identities and makes the retrospective parsing assumption explicit.
+`responses/*.json` preserves the raw structured generations consumed by this run for audit. These
+files can repeat licensed or private source text and remain gitignored local artifacts.
 
 ### `run.failed.json`
 
@@ -140,7 +188,15 @@ not an investment recommendation.
 
 ## Backtest JSON
 
-Each family’s `backtest.json` contains:
+Each family’s `backtest.json` contains the development window. `final_holdout.json` has the same
+schema for the reserved final periods, and the two comparison JSON files keep their family metrics
+separate. Each comparison file is an envelope with `evaluation_window`, the complete
+`evaluation_protocol`, and a `families` metrics mapping. It also carries an artifact schema version,
+run/config/code identity, input role hashes, feature/label/model versions, and complete configured
+cost, constraint, horizon, and selection assumptions. The final manifest remains canonical for the
+full data and generated-artifact manifests.
+
+Each replay JSON contains:
 
 | Key | Contents |
 |---|---|
@@ -149,7 +205,46 @@ Each family’s `backtest.json` contains:
 | `trades` | Entry and forced-exit records with raw fill price, decision-time liquidity, participation, reason codes, and cost breakdown. |
 | `positions` | Target and post-return weights plus per-asset contribution. |
 | `final_positions` | Empty for the current forced-liquidation round trips. |
-| `assumptions` | Execution clock, label coverage, liquidity basis, turnover basis, buffer, and unmodeled effects. |
+| `assumptions` | Execution clock, label coverage, `top_k` selection depth, liquidity and turnover bases, buffer, and unmodeled effects. |
+| `evaluation_window` | Development end-exclusive or final-holdout start-inclusive boundary. |
+
+## Paper snapshot and event ledger
+
+`paper/snapshot.json` is an intent-only current view. It records the decision and intended execution
+timestamps, unchanged initial equity, empty trades and positions, constrained intents with rejection
+or risk reason codes, and a `ledger` reference containing the event path, sequence, and event hash.
+Its `research_protocol` records the run/config identity, horizon, `top_k`, same-day buffer, and exact
+effective entry constraints used to size the intents; the hash-chained event repeats that protocol.
+The pipeline uses `models.top_k` and the same portfolio constructor as model-family backtests, so the
+paper intents are capped and constrained by the same selection semantics. Equal-weight and no-trade
+remain backtest reference paths rather than paper intent families.
+
+`paper/events.jsonl` is append-only evidence. The pipeline writes a `paper_intent_batch` event; a
+direct `PaperSimulator` can optionally append `paper_rebalance` and `paper_mark_to_market` events.
+Every record requires `simulation_only=true` and a timezone-aware `asof_ts`, which is normalized to
+UTC, and includes:
+
+| Key | Meaning |
+|---|---|
+| `sequence` | Contiguous one-based event position. |
+| `previous_event_hash` | SHA-256 link to the preceding event, or the fixed genesis hash for event one. |
+| `event_hash` | SHA-256 of the canonical event including its sequence and previous-hash link, but excluding this field itself. |
+
+Use `PaperEventLedger(path).replay()` to read the file. Replay rejects malformed or partial lines,
+duplicate JSON keys, noncanonical record encodings, noncanonical or regressing timestamps,
+missing/false simulation markers, sequence gaps, broken hash links, and payload tampering. Append
+first replays the existing chain, so a detected modification prevents extending it. The hash chain
+is tamper-evident rather than an authenticated signature: a party able to rewrite the whole file can
+recompute its suffix, and no trusted external timestamp is added.
+
+`PaperSimulator` requires a missing or empty ledger when it is constructed. It does not recover
+equity, positions, metadata, or configuration from prior records, so a new simulator refuses to
+extend a nonempty ledger rather than silently starting a new state sequence in the same chain.
+
+The ledger supports one serialized writer per file. It does not lock the file or provide an atomic
+cross-process sequence reservation; concurrent writers can derive the same next sequence and prior
+hash. Route all appends for one ledger path through one process or an external lock. `snapshot.json`
+is a derived convenience artifact and should not be used to validate the chain independently.
 
 ## Metric guide
 
@@ -177,11 +272,21 @@ day. This is why `average_holding_period_days` and the borrow-cost day basis nee
 ## Prediction evaluation
 
 `prediction_metrics.json` contains aggregate and mean-daily Pearson/Spearman IC, hit rate,
-precision-at-k, mean squared error, optional binary calibration diagnostics, and available breakdowns
-by sector, liquidity, volatility, source, and event metadata.
+precision-at-k, and available breakdowns by sector, liquidity, volatility, source, and event metadata.
+Top-level `families` and `segments` cover development periods; `final_holdout` contains the same
+structure for the configured final fully observed periods, and `evaluation_protocol` records the
+boundary, the contiguous whole-cross-section development suffix purged from the first overlap, and
+the predeclared frozen-training rule. The nested final-holdout training record includes its exclusive
+cutoff, training row count, membership digest, and `verified_untouched` marker.
 
-When an explicit `probability_up` is absent, calibration uses a logistic transform of the raw score.
-Treat it as a score diagnostic, not a calibrated probability claim.
+Mean squared error appears only when predictions provide explicit `expected_return`. Binary Brier and
+calibration diagnostics appear only with explicit `probability_up`. The built-in rank baseline emits
+neither, and its raw score is never transformed into a claimed probability. Optional expected-return,
+probability, and binary-target fields require all-or-none coverage across all observed development and
+holdout rows for a family.
+`metric_definitions` records that precision-at-k is a raw-score, long-side diagnostic rather than the
+absolute-score constrained portfolio selection used by backtests, and records the fractional cutoff-
+tie policy that makes the diagnostic independent of input row order.
 
 ## Read Parquet locally
 
@@ -234,6 +339,7 @@ Related documentation:
 - [Architecture](architecture.md)
 - [Research protocol](research_protocol.md)
 - [Backtesting](backtesting.md)
+- [Broker integration](broker.md)
 - [Troubleshooting](troubleshooting.md)
 
 Return to the [documentation home](README.md).

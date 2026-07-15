@@ -47,12 +47,12 @@ uv run nlp-trader smoke --config configs/sample.yaml
 ingest market + ingest text
             |
             v
-       build features
+       annotate text (disabled no-op in sample)
             |
             v
-       build labels
-            |
-            v
+       build features + build labels
+                    |
+                    v
     train -> predict -> backtest -> report
 ```
 
@@ -69,8 +69,9 @@ Read these in order:
    and per-period diagnostics.
 2. `reports/sample/<run_id>/run.final.json` — machine-readable provenance, hashes, config hash,
    metrics, and completion status. The full resolved config is in `config.snapshot.json`.
-3. `data/processed/sample/<run_id>/evaluation/backtest_comparison.json` — side-by-side model and
-   benchmark results.
+3. `data/processed/sample/<run_id>/evaluation/backtest_comparison.json` — side-by-side development
+   model and benchmark results with their evaluation boundary; the separately named final-holdout
+   comparison has the same envelope.
 4. `data/processed/sample/<run_id>/backtests/<family>/backtest.json` — trades, positions, costs,
    exposures, and period records for one family.
 
@@ -134,9 +135,21 @@ uv run nlp-trader validate-config --config configs/local.yaml
 
 The template is expected to report missing files until you provide them.
 
+For permitted Japanese cash-equity exports, start from `configs/japan_baseline.yaml` instead of
+loosening the generic schema. It selects the XJPX calendar and strict local contract, and is also
+expected to fail until its private input files exist. Follow [Japan cash-equity baseline](japan_baseline.md)
+for J-Quants V2 normalization, availability timestamps, and the market-only empty-text setup.
+
+The research and paper commands above never connect to a broker. The optional kabuS API integration
+is a separate, explicitly gated workflow that must run on the same Windows PC as kabuStation; it is
+not usable from this Mac for live routing. Start with the fixed-response validation environment and
+follow [kabuS API broker operations](broker.md) before enabling any production command.
+
 ## Next steps
 
 - [Configuration reference](configuration.md)
+- [Japan cash-equity baseline](japan_baseline.md)
+- [kabuS API broker operations](broker.md)
 - [Input data guide](input_data.md)
 - [Outputs and artifacts](outputs.md)
 - [Troubleshooting](troubleshooting.md)

@@ -19,9 +19,10 @@ this page explains how to judge a run.
    constraints before inspecting final results. The implemented decision is after the completed
    official-close bar; entry is the raw next official open and exit is the raw exact horizon close.
    Return outcomes compare those tradable prices on the causal per-bar adjustment basis.
-5. Reserve an untouched terminal test period outside this pipeline when making a final research
-   claim. The implemented expanding walk-forward evaluation does not create a separate terminal
-   holdout automatically.
+5. Set `models.final_holdout_periods` before inspecting results. The pipeline reserves those final
+   fully observed decision periods from top-level development diagnostics and reports them separately.
+   Do not repeatedly tune against that output; after inspection, a new untouched period is required
+   for another confirmatory claim.
 6. Validate the config and retain the exact local inputs; do not edit a source file during a run.
 
 Runtime dates define the decisions being studied. The implementation automatically loads the
@@ -32,6 +33,31 @@ contains that context; the pipeline does not fabricate missing history or future
 Known earnings and corporate-action event context is bounded separately to
 `event_lookahead_days` calendar days after the last selected decision (30 by default), and remains
 gated by `available_at <= asof_ts`.
+
+### Predeclare a generative-annotation experiment
+
+Treat optional generative annotation as a separate, frozen parser experiment. First evaluate a
+fixed labeled annotation set with stance macro-F1, event F1, evidence precision, abstention and
+invalid-output rates, and confidence calibration. Freeze the local model bytes, prompt version,
+output schema, decoding settings, and labeled set before running market evaluation.
+
+Compare matched pipeline runs:
+
+1. deterministic baseline with generative annotation disabled; and
+2. the same data, universe, dates, costs, constraints, horizon, holdout, and random seeds with
+   annotation enabled and explicitly applied to features.
+
+Use distinct feature/model versions. Traditional-only and naive families should be identical; only
+text and combined families may change. A sidecar-only run is useful for annotation review but is not
+an applied-LLM performance comparison. Preserve both positive and negative results, and do not tune
+the prompt/model on Sharpe or repeatedly inspect the final holdout.
+
+Point-in-time prompts are necessary but not sufficient for historical validity. A modern pretrained
+model can encode facts learned after a source document’s `available_at`, even without retrieval or
+future text in the prompt. Record the run as a `retrospective_parser`; where historical deployment
+claims matter, use the exact model/version actually available then and consider blinding issuer names
+and dates. Otherwise describe the result only as retrospective extraction, not a contemporaneously
+deployable signal.
 
 ## Immutable run record
 
@@ -61,12 +87,22 @@ silently changing the experiment.
 ## Model evaluation
 
 The baseline trainer creates incremental expanding walk-forward snapshots. At each decision time it
-adds only labels whose `label_end_ts` is strictly earlier than the effective training cutoff. The
-configured embargo removes recent decision periods, and no model is fitted until `min_train_rows` is
-met. Coefficient fitting uses running sufficient statistics instead of rebuilding a historical
+adds only labels whose actual availability is strictly earlier than the effective training cutoff.
+Availability resolves in conservative precedence order: explicit `label_available_at`, generic
+`available_at`, then `label_end_ts` only as a fallback for caller-supplied legacy labels. Generated
+market labels record the complete exit cross-section's actual availability. The configured embargo
+removes recent decision periods, and no model is fitted until `min_train_rows` is met. Coefficient
+fitting uses running sufficient statistics instead of rebuilding a historical
 feature matrix for every snapshot. Default training also updates an ordered membership digest
 incrementally, so it does not retain every eligible key; explicit key lists are available only through
-the opt-in diagnostic `record_training_keys` path.
+the opt-in diagnostic `record_training_keys` path. At the first configured final-holdout decision, the
+trainer freezes the embargo-adjusted state built only from labels available before its exclusive
+cutoff. Every decision at or after that boundary reuses the same membership digest and coefficients.
+
+Candidate outcomes are admitted only as whole decision-and-horizon cross-sections. A missing label,
+partial outcome, or non-terminal wholly censored group fails rather than selecting assets using future
+outcome availability. Only a common trailing group whose expected label ends all exceed the final
+decision boundary may be omitted.
 
 The typed config requires these three canonical model families, in this order:
 
@@ -80,11 +116,15 @@ It also evaluates fixed naive benchmarks:
 - momentum-only score
 - no-trade score
 
-Prediction diagnostics include aggregate and mean-daily Pearson/Spearman IC, hit rate, precision at
-k, and mean squared error. Binary labels also produce Brier score, expected calibration error, and
-calibration bins. An explicit `probability_up` is used when present; the current baseline predictions
-otherwise apply a logistic transform to their score, so those calibration values are diagnostics of
-an uncalibrated score proxy rather than a calibrated probability model.
+Prediction diagnostics include aggregate and mean-daily Pearson/Spearman IC, hit rate, and precision
+at k. Mean squared error is emitted only for predictions with explicit `expected_return`; Brier score,
+expected calibration error, and calibration bins require explicit `probability_up`. The current
+baseline produces neither field because its score is directional ranking information, not a calibrated
+return or probability. Optional prediction/target fields must have all-or-none coverage across the
+entire observed family before development/holdout splitting. Precision-at-k is a long-side raw-score diagnostic; constrained portfolio selection
+is evaluated separately by the backtest and can rank eligible long/short candidates by absolute score.
+Precision cutoff ties use their tied positive rate as fractional credit, making results invariant to
+input row order.
 
 Each family is also evaluated, when contemporaneous metadata is present, by sector, fixed liquidity
 bucket, fixed volatility regime, source availability/type, and event availability/type. Thresholds
@@ -93,20 +133,29 @@ portfolio, two-sided cost, forced-liquidation, and backtest machinery. Compare t
 with traditional-only and naive results; a positive combined backtest alone is not evidence that text
 added value.
 
-The current pipeline does not automatically create purged cross-validation folds or a final untouched
-holdout. It emits calibration tables and segmented metrics, not calibration plots, statistical
-significance tests, or a causal attribution of performance to a segment. Those analyses must be
-added or performed separately before a substantive conclusion.
+The last configured fully observed periods are reported in a separate `final_holdout` section; the
+top-level family and segment metrics cover development periods only. Label availability strictly
+before each effective training cutoff supplies the walk-forward purge rule. Development removes the
+contiguous whole-cross-section suffix beginning with the first decision whose labels are not all
+available before the holdout boundary; this preserves a fixed multi-session replay phase even when
+vendor availability is delayed out of order. Within the holdout, one frozen pre-boundary model is
+reused; earlier holdout outcomes never update later holdout predictions.
+The saved model and evaluation protocols record the boundary, exclusive training cutoff, key count,
+and membership digest. The pipeline does not create combinatorial purged folds, calibration plots,
+statistical significance tests, or causal attribution of performance to a segment. The software
+cannot prevent repeated human inspection from invalidating the holdout.
 
 ## Acceptance checklist
 
 Before accepting a result, verify:
 
-- No feature input has `available_at > asof_ts`; after-hours text uses the next configured decision.
+- No feature input has `available_at > asof_ts`; after-hours text uses the first configured market
+  decision at or after its availability.
 - Every daily OHLC row retains raw tradable prices, is marked
-  `corporate_action_adjusted=true`, has `adjustment_vintage_at <= ts`, and supplies a positive causal
-  `return_adjustment_factor`; optional corporate-action events and `adjusted_close` do not substitute
-  for that point-in-time contract.
+  `corporate_action_adjusted=true`, proves its adjustment vintage was usable by the decision, and
+  supplies a positive causal `return_adjustment_factor`; optional corporate-action events and
+  `adjusted_close` do not substitute for that point-in-time contract. If a bar's explicit
+  `available_at` follows `ts`, its vintage may follow `ts` but not `available_at`.
 - Label windows record the raw exact next-session open and horizon-session close as execution
   prices, calculate returns from each `raw_price * return_adjustment_factor`, and enter training only
   after the label is observable.
@@ -116,6 +165,8 @@ Before accepting a result, verify:
 - Syndicated/duplicate text is not counted as independent evidence; the incremental cluster assignment
   uses no future document.
 - Historical social metadata existed at the decision time and is licensed for retention.
+- A generative-annotation run is source-grounded, has valid evidence spans, declares its retrospective
+  status, and has no price, label, later-document, or retrieval context in its prompts.
 - Model selection did not use the reserved final test period.
 - Commission, spread, slippage, impact, borrow, turnover, participation, liquidity, and fill
   assumptions are appropriate for the data and strategy.

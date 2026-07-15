@@ -41,8 +41,8 @@ available memory.
 Minimal CSV:
 
 ```csv
-asset_id,symbol,exchange,currency,name,sector,active_from,active_to
-asset_aapl,AAPL,XNAS,USD,Apple Inc.,Technology,1980-12-12,
+asset_id,symbol,exchange,currency,name,sector,active_from,active_to,short_available,hard_to_borrow
+asset_aapl,AAPL,XNAS,USD,Apple Inc.,Technology,1980-12-12,,false,false
 ```
 
 | Field | Required | Type | Meaning |
@@ -57,9 +57,18 @@ asset_aapl,AAPL,XNAS,USD,Apple Inc.,Technology,1980-12-12,
 | `active_to` | no | ISO date | Final active exchange-local date. Must not precede `active_from`. |
 | `cik`, `figi`, `isin` | no | string | External identifiers when available. |
 | `industry` | no | string | More detailed classification. |
+| `trading_unit` | no | positive integer | Tradable lot size. Required by `japan_cash_equity_v1` and checked against every Japanese bar. |
+| `short_available` | no | boolean | Point-in-time-valid permission to model a short. Missing values default to `false`. |
+| `hard_to_borrow` | no | boolean | Marks an available short as hard to borrow. When omitted, defaults to `true` for a shortable asset and `false` otherwise. |
 
 Keep delisted assets and historical symbol/identity changes when the research period requires them.
 A current-only asset list creates survivorship bias.
+
+For every exchange session between the first and last in-scope market bar, each asset whose active
+interval includes that session must have a bar. The feature and label builders fail on a missing
+active asset rather than silently shrinking the cross-section. Borrow fields are static within one
+asset-master input; split runs or provide properly vintaged inputs when availability changes over
+time. Present-day locate status must not be projected backward.
 
 ## Required input 2: daily market bars
 
@@ -73,15 +82,20 @@ asset_aapl,AAPL,2026-07-13T20:00:00Z,1d,210.00,214.00,209.50,213.25,50000000,212
 | Field | Required | Type | Meaning |
 |---|---:|---|---|
 | `asset_id`, `symbol` | yes | string | Must match one asset-master row. |
-| `ts` | yes | aware timestamp | Official session-close timestamp used as the decision time. |
+| `ts` | yes | aware timestamp | Official session-close timestamp for the market event. It may precede the decision when delivery is delayed. |
 | `bar_size` | yes | string | Current pipeline requests `1d`. |
 | `open`, `high`, `low`, `close` | yes | positive float | Raw tradable prices. OHLC consistency is validated. |
 | `volume` | yes | non-negative integer | Raw volume. |
 | `vwap` | no | positive float | Optional reference value. |
 | `adjusted_close` | no | positive float | Stored in silver only; it does not satisfy the causal adjustment contract. |
 | `corporate_action_adjusted` | yes for feature/label runs | boolean | Certifies that the causal adjustment metadata is present and complete. It does not mean raw OHLC was rewritten. |
-| `adjustment_vintage_at` | yes when the flag is true | aware timestamp | Must be no later than `ts`. |
+| `adjustment_vintage_at` | yes when the flag is true | aware timestamp | When that causal factor vintage became usable. Without a separate bar `available_at`, it must be no later than `ts`; otherwise it must be no later than `available_at`. |
 | `return_adjustment_factor` | yes | positive float | Causal per-bar factor used to compare returns across corporate actions. |
+| `exchange`, `currency` | no generally | string | Required as `XJPX` and `JPY` by `japan_cash_equity_v1`. |
+| `trading_unit` | no generally | positive integer | Required by the Japanese contract and must match the asset master. |
+| `session_date` | no generally | ISO date | Required by the Japanese contract and must match `ts` in Asia/Tokyo. |
+| `available_at` | no generally | aware timestamp | Required by the Japanese contract; earliest defensible availability of this exact bar payload. |
+| `price_basis` | no generally | `raw_tradable` | Required by the Japanese contract; certifies the OHLC fields are unadjusted tradable values. |
 
 The two price concepts are intentionally separate:
 
@@ -92,7 +106,19 @@ The provider must construct the factor from information available at the recorde
 retrospectively adjusted series without revision provenance is not acceptable.
 
 Bars must be unique and internally contiguous on the configured exchange calendar. A missing
-session inside a series fails feature/label construction; the pipeline does not invent a bar.
+session inside an asset series or a missing active asset in a session cross-section fails
+feature/label construction; the pipeline does not invent a bar or silently remove an asset.
+
+### Strict Japanese cash-equity input
+
+Select `data.calendar: XJPX` together with
+`data.market_contract: japan_cash_equity_v1`. This contract requires exact XJPX/JPY metadata, a
+canonical four-character Japanese security code, an explicit trading unit, session date, official
+close `ts`, later-or-equal `available_at`, raw-tradable price basis, and causal adjustment vintage.
+It rejects unknown columns rather than silently discarding source ambiguity.
+
+For the exact field lists, J-Quants V2 mapping, after-close delivery semantics, and an empty-text
+market-only starting point, see [Japan cash-equity baseline](japan_baseline.md).
 
 ## Required input 3: text items
 
@@ -160,6 +186,20 @@ nonempty `entities` list suppresses automatic linking, so a symbol-only entry is
 resolved. If `entities` is absent or empty, the deterministic linker uses the filtered asset master,
 company aliases, symbols, and cashtags.
 
+### Optional generative annotation input
+
+The optional local generative annotator receives one normalized `TextItem` at a time, the
+deterministically linked and historically active asset candidates, and host-numbered source-text
+spans. It does not receive labels, prices, returns, later documents, or external retrieval results.
+The model must select evidence span IDs from that supplied text; it cannot introduce another asset
+or cite an invented span. Title/body content must therefore be present and permitted for local model
+processing when this path is enabled.
+
+The annotation inherits the source item’s `available_at` for research feature timing. The actual
+annotation-stage completion time is audit metadata, not evidence that the chosen model existed or
+ran at that historical instant. This is a retrospective parsing assumption; see
+[Research protocol](research_protocol.md) before interpreting a historical run.
+
 ### Social-data warning
 
 Hashing raw identifiers in silver does not erase them from bronze. The bronze store preserves the
@@ -226,6 +266,8 @@ feature builder. Event records never calculate or replace the market bar’s cau
 - [ ] Social identifiers and retention status follow source terms.
 - [ ] License/terms references are meaningful and current.
 - [ ] Input paths are outside artifact roots.
+- [ ] If generative annotation is enabled, its exact local model directory and model license are
+  recorded and the directory is outside artifact roots.
 - [ ] The requested interval includes enough source history and future label bars.
 
 Run:
