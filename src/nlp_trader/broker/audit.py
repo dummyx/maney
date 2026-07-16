@@ -14,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from nlp_trader.broker.state import KabuSStateLockError, advisory_file_lock
+from nlp_trader.immutable.append import SafeFileError, append_bytes_durable
 from nlp_trader.timestamps import format_utc, parse_utc
 
 GENESIS_EVENT_HASH = "0" * 64
@@ -180,30 +181,20 @@ class BrokerAuditLedger:
             raise BrokerAuditLockError("broker audit ledger lock is unavailable") from exc
 
     def _append_bytes(self, encoded: bytes) -> None:
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        path = self.path.expanduser().absolute()
         try:
-            descriptor = os.open(self.path, flags, 0o600)
-        except OSError as exc:
+            append_bytes_durable(path, encoded)
+        except SafeFileError as exc:
+            message = (
+                "broker audit ledger append failed"
+                if exc.operation == "append"
+                else "broker audit ledger cannot be opened safely for append"
+            )
+            raise BrokerAuditValidationError(message) from exc
+        except (OSError, ValueError) as exc:
             raise BrokerAuditValidationError(
                 "broker audit ledger cannot be opened safely for append"
             ) from exc
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise BrokerAuditValidationError("broker audit ledger must be a regular file")
-            if hasattr(os, "fchmod"):
-                os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "ab", closefd=False) as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except OSError as exc:
-            raise BrokerAuditValidationError("broker audit ledger append failed") from exc
-        finally:
-            os.close(descriptor)
 
     def _replay_unlocked(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []

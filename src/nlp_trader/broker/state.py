@@ -1,27 +1,30 @@
 from __future__ import annotations
 
-import errno
-import json
 import os
-import stat
 import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
+from nlp_trader.immutable.locking import (
+    MAX_LOCK_OWNER_BYTES as _MAX_LOCK_OWNER_BYTES,
+)
+from nlp_trader.immutable.locking import (
+    AdvisoryFileLockError,
+    AdvisoryFileLockUnavailable,
+)
+from nlp_trader.immutable.locking import (
+    advisory_file_lock as _neutral_advisory_file_lock,
+)
+
+MAX_LOCK_OWNER_BYTES = _MAX_LOCK_OWNER_BYTES
 
 _APPLICATION_DIRECTORY = "nlp-trader"
 _BROKER_DIRECTORY = "kabus"
 _AUDIT_FILENAME = "audit.jsonl"
 _KILL_SWITCH_FILENAME = "KILL_SWITCH"
 _OPERATION_LOCK_FILENAME = "operation.lock"
-MAX_LOCK_OWNER_BYTES = 256
 
 
 class KabuSStatePathError(RuntimeError):
@@ -30,10 +33,6 @@ class KabuSStatePathError(RuntimeError):
 
 class KabuSStateLockError(RuntimeError):
     """Raised when exclusive ownership of the broker operation lock is unavailable."""
-
-
-class _LockContentionError(Exception):
-    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,106 +116,41 @@ def _current_user_state_root(
 def advisory_file_lock(path: str | Path) -> Iterator[None]:
     """Hold a nonblocking OS advisory lock until this context or process exits."""
 
-    lock_path = Path(path).expanduser()
-    if not lock_path.is_absolute():
-        raise ValueError("broker operation lock path must be absolute")
-    lock_path = lock_path.parent.resolve(strict=False) / lock_path.name
-    _ensure_private_directory(lock_path.parent)
-
-    descriptor = _open_lock_file(lock_path)
+    context = _neutral_advisory_file_lock(path)
     try:
-        try:
-            _acquire_nonblocking(descriptor)
-        except _LockContentionError:
-            raise KabuSStateLockError("another broker operation already holds the lock") from None
-        except OSError:
-            raise KabuSStateLockError("broker operation lock could not be acquired") from None
-        _write_owner_metadata(descriptor)
+        context.__enter__()
+    except ValueError as exc:
+        raise ValueError("broker operation lock path must be absolute") from exc
+    except AdvisoryFileLockUnavailable:
+        raise KabuSStateLockError("another broker operation already holds the lock") from None
+    except AdvisoryFileLockError as exc:
+        _raise_broker_lock_error(exc)
+    try:
         yield
-    finally:
-        # Closing a locked descriptor releases flock/locking even when unwinding an exception.
-        # The OS performs the same release if the process exits without running this block.
-        try:
-            os.close(descriptor)
-        except OSError:
-            raise KabuSStateLockError("broker operation lock could not be released") from None
-
-
-def _ensure_private_directory(path: Path) -> None:
-    try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path, 0o700)
-    except OSError as exc:
-        raise KabuSStateLockError("broker operation lock directory is unavailable") from exc
-
-
-def _open_lock_file(path: Path) -> int:
-    flags = os.O_CREAT | os.O_RDWR
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if sys.platform == "win32" and hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError:
-        raise KabuSStateLockError("broker operation lock file is unavailable") from None
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise KabuSStateLockError("broker operation lock must be a regular file")
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        if os.fstat(descriptor).st_size == 0:
-            os.write(descriptor, b"\0")
-            os.fsync(descriptor)
     except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
-
-
-def _acquire_nonblocking(descriptor: int) -> None:
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    if sys.platform == "win32":
+        exception_type, exception, traceback = sys.exc_info()
         try:
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or getattr(
-                exc, "winerror", None
-            ) in {33, 36, 158}:
-                raise _LockContentionError from exc
+            suppress = context.__exit__(exception_type, exception, traceback)
+        except AdvisoryFileLockError as lock_error:
+            _raise_broker_lock_error(lock_error)
+        if not suppress:
             raise
     else:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                raise _LockContentionError from exc
-            raise
+            context.__exit__(None, None, None)
+        except AdvisoryFileLockError as exc:
+            _raise_broker_lock_error(exc)
 
 
-def _write_owner_metadata(descriptor: int) -> None:
-    owner = {
-        "acquired_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "pid": os.getpid(),
+def _raise_broker_lock_error(error: AdvisoryFileLockError) -> None:
+    messages = {
+        "directory": "broker operation lock directory is unavailable",
+        "open": "broker operation lock file is unavailable",
+        "regular_file": "broker operation lock must be a regular file",
+        "owner_size": "broker operation lock owner metadata exceeds its bound",
+        "owner_write": "broker operation lock owner metadata could not be written",
+        "release": "broker operation lock could not be released",
     }
-    encoded = (
-        json.dumps(owner, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("ascii")
-    if len(encoded) > MAX_LOCK_OWNER_BYTES:
-        raise KabuSStateLockError("broker operation lock owner metadata exceeds its bound")
-    try:
-        os.ftruncate(descriptor, 0)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        view = memoryview(encoded)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short write")
-            view = view[written:]
-        os.fsync(descriptor)
-    except OSError:
-        raise KabuSStateLockError(
-            "broker operation lock owner metadata could not be written"
-        ) from None
+    raise KabuSStateLockError(
+        messages.get(error.operation, "broker operation lock could not be acquired")
+    ) from error
