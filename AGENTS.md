@@ -126,6 +126,11 @@ Paper output must remain simulated or intent-only and must not connect to a brok
 
 The useful baseline must remain deterministic and must not require a large language model.
 
+Assume all model inference, including LLM inference, runs locally. Do not treat hosted-API spend or
+inference economics as a model-selection criterion, deduct it from backtest returns, or use it in
+research conclusions unless the user explicitly changes this convention. Runtime, throughput, and
+memory may still be measured as engineering-feasibility diagnostics.
+
 Optional transformer or LLM components must:
 
 - support batching and CPU fallback; PyTorch transformers may use MPS, while GGUF inference may use
