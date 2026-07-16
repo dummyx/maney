@@ -8,6 +8,65 @@ the config, run the walk-forward comparison, inspect implementation diagnostics,
 research conclusion. [Getting started](getting_started.md) explains how to execute the pipeline;
 this page explains how to judge a run.
 
+## Local agent-study protocol
+
+The optional implementation follows the complete core lifecycle. An immutable study progresses
+through
+`development_open -> development_locked -> candidate_frozen -> holdout_revealed -> closed`, with
+early closure permitted before reveal. A trusted host command must reserve each proposal attempt in
+the one global registry before any model request. Every reservation consumes the fixed proposal
+budget, including crashes, malformed output, rejection, abstention, duplication, and negative
+results. Reservation is an explicit authoritative action rather than an implicit side effect of view
+export or model startup.
+
+The analyst sees only a sealed development view. Ordinary completed pipeline runs already expose
+their configured holdout to the host and are therefore always exploratory inputs to this workflow.
+Confirmatory eligibility requires the development-only runner, which emits no holdout artifact.
+The final holdout must never enter analyst prompts, tools, caches, replay context, or memory.
+The development runner retains a whole decision-and-horizon label cross-section only when every
+label end and actual availability timestamp is strictly before the registered holdout decision
+start. This purges overlapping labels before candidate selection even when the holdout outcome
+interval starts later.
+
+A verified proposal still requires human semantic review. A development run requires approval
+of the exact proposal and compiled execution-definition hashes. Before recording that approval, the
+trusted host reloads the terminal proposal from the registered agent-run path, verifies its exact
+bytes, and deterministically remaps its permitted parameters. It also reloads the fixed compiled
+directory, checks canonical definition and manifest bytes, every listed file hash, the typed base
+config, dates, costs, constraints, and fixed output schemas. The development runner then reloads the
+exact registry approval event and immutable approval artifact before consuming the one run. After
+seeing that development result, a human must separately freeze one exact candidate before a
+registered one-time holdout reveal. Verifier passage establishes contract compliance, not truth,
+profitability, deployability, or permission to trade. Negative results, abstentions, and
+closed-without-reveal studies are complete outcomes and remain immutable.
+
+Before the irreversible freeze event, the host replays the completed development lineage, rehashes
+the result, model, and required-evaluation artifacts, derives the template and typed patches from the
+approved definition, and accepts only a selected learned family present in the frozen model.
+
+The first compiler template changes only the permitted text-decay field and retains traditional,
+text, combined, equal-weight, momentum-only, and no-trade paths with the same universe, dates,
+labels, costs, fills, constraints, and seeds. The selector matrix separately evaluates full eligible,
+repeated seeded random-k, causal momentum-with-skip, and causal low-volatility membership through the
+same deterministic backtest engine.
+
+The registered reveal admits only whole decision-and-horizon label cross-sections whose outcome end
+and actual availability both fall inside the frozen outcome interval. It preserves only the canonical
+wholly censored trailing-group omission; a partial cross-section always fails closed.
+
+Predeclared downstream evaluation requires baseline, early/late endpoint shifts, causal delay,
+shuffled text, and named source-ablation scenarios for every attempted candidate. It reports paired
+net-return effect sizes against the fixed-template control, moving-block-bootstrap intervals,
+Holm-adjusted comparisons, all attempts, negative results, regime/behavior subgroups, and limitations.
+Proposal quality is scored separately with a blinded frozen rubric against a fixed-template/no-agent
+control; acceptance rate is not an evaluation target.
+
+The development-only runner does not execute those downstream negative-control or robustness
+scenarios. It verifies the required learned and fixed families in its backtest comparison, then
+writes `required_evaluation_contract.json` with the remaining scenario declarations explicitly
+marked `predeclared_not_executed`. The separate robustness/downstream evaluator is required before
+claiming those checks were performed.
+
 ## Before a run
 
 1. Confirm that every input is licensed for the intended research and local retention.

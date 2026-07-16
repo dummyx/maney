@@ -155,6 +155,7 @@ follow [kabuS API broker operations](broker.md) before enabling any production c
 ## Next steps
 
 - [Configuration reference](configuration.md)
+- [Optional local research-agent study](workflows.md#local-research-agent-study)
 - [Japan cash-equity baseline](japan_baseline.md)
 - [kabuS API broker operations](broker.md)
 - [Input data guide](input_data.md)

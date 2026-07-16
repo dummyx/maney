@@ -18,6 +18,34 @@ kill-switch, and operation-lock paths are fixed current-user safety state shared
 configs and both environments; they are not YAML fields. See [Broker integration](broker.md) for the
 broker schema, password handling, fixed state paths, and production gates.
 
+The research-agent sidecar also has an independent schema. It is deliberately not a field in
+`ResearchConfig`, so ordinary config snapshots and pipeline behavior remain unchanged. The bundled
+`configs/research_agent.disabled.yaml` file is the inert example consumed explicitly by agent-study
+commands. It never activates the subsystem during an ordinary pipeline run.
+
+## Independent research-agent config
+
+`load_research_agent_config(...)` resolves relative `model_path` and `artifact_root` values from the
+agent YAML file and returns a frozen, strict `ResearchAgentConfig`. Unknown fields, non-finite
+numbers, relative resolved paths, and inconsistent bounds fail validation. Loading validates the
+configuration contract. For an enabled config, validation reads and hashes the configured GGUF
+bytes; it does not instantiate the model, create a registry, run inference, or start an agent.
+
+| Field group | Contract |
+|---|---|
+| Activation | `enabled` defaults to `false`; the only current role is `analyst` and backend is `llama_cpp_gguf`. |
+| Model identity | Enabled configs require one direct absolute `model_path` and its expected lowercase SHA-256, plus logical ID, revision, and terms reference. Config validation hashes the file; only `nlp-trader-agent propose` instantiates it for inference. |
+| Version identity | Prompt, action schema, proposal schema, tool catalog, verifier, runtime, scrub-policy, and config-schema versions are explicit. |
+| Determinism | Decoding is `greedy` and the positive seed is frozen in the config content hash. |
+| Resource limits | Context/input/output tokens, steps, tool calls, evidence results/pages, per-step/per-run result bytes, wall time, and retained artifact bytes are positive and bounded. Input plus output tokens cannot exceed context; tool calls must leave a terminal step. |
+| Artifact root | `artifact_root` is independent from the pipeline's five roots. Helpers require an absolute, private, non-symlink directory. Registry, study, bundle, run, compilation, development, candidate, reveal, and audit artifacts live below it. |
+| Diagnostics | `feasibility_diagnostics` permits local runtime/throughput/memory diagnostics; it is not a profitability or promotion criterion. |
+
+`enabled: true` is required only for model-backed `propose`. Deterministic
+create/export/verify/replay and later trusted lifecycle commands should use the disabled config, so
+they neither hash nor instantiate the GGUF. Do not place secrets, broker details, data payloads, or
+account identifiers in this file.
+
 ## Path rules
 
 Relative paths are resolved from the directory containing the YAML file, not from the shell’s

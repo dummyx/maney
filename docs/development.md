@@ -51,6 +51,11 @@ src/nlp_trader/
   providers.py              protocols and local provider implementations
   research.py               run context, hashing, and manifests
   reports.py                Markdown research notes
+  immutable/                neutral advisory-lock and durable regular-file write primitives
+  research_agents/          import-isolated analyst, contracts, tools, registry, audit, and runtime
+  research_templates/       closed deterministic compiler/evaluation templates
+  experiment_execution.py  exact approved development-only runner
+  holdout_execution.py      trusted frozen-candidate one-time evaluator
   schemas/                  typed boundary records
 tests/
   acceptance/               explicitly gated real local model checks
@@ -222,6 +227,48 @@ No backtest or paper change authorizes live routing.
 - Add injected-generator/cache/failure-before-parse, leakage, verifier, feature-family, ablation, and
   DecisionRound tamper/replay tests without requiring a model download or accelerator. Keep one
   environment-gated acceptance test for the pinned real GGUF path.
+
+## Extend the research-agent sidecar
+
+The core Phase 0–6 sidecar is implemented. Preserve its capability split and keep these behavior
+locks green:
+
+- `ResearchConfig`, the standard `nlp-trader` script binding, pipeline manifests/reports, annotation
+  `DecisionRound`, paper, and broker behavior remain unchanged while the sidecar is unused.
+- AST and runtime checks reject imports from `research_agents` to `nlp_trader.cli`, `pipeline`,
+  `paper`, `portfolio`, `backtest`, or `broker`.
+- Normal tests inject generation and require no GGUF, llama.cpp import, network, credentials, MPS, or
+  Metal.
+- Trusted registry and exporter commands stay on the deterministic CLI side. The model-capable entry
+  point receives a sealed bundle path from the human host but never exposes that path to the model.
+
+Neutral advisory-lock and safe regular-file append/fsync mechanics remain domain-independent. Broker
+and research transitions stay in separate ledgers. The primitives use nonblocking locks, reject
+symlinks and non-regular files, loop on short writes, fsync content, and fsync the parent when an
+authority ledger is first created. Do not introduce a generic domain ledger abstraction.
+
+When changing the sidecar, run the focused contracts, workflow, development, reveal, audit, selector,
+and isolation tests before the full gates:
+
+```bash
+uv run pytest \
+  tests/unit/test_agent_study_cli.py \
+  tests/unit/test_immutable_locking.py \
+  tests/unit/test_local_generation.py \
+  tests/unit/test_research_agent_*.py \
+  tests/integration/test_research_agent_*.py \
+  tests/integration/test_agent_development_execution.py \
+  tests/integration/test_agent_holdout_reveal.py \
+  tests/integration/test_selector_signal_matrix.py \
+  tests/regression/test_agent_*.py \
+  tests/regression/test_broker_locking_unchanged.py \
+  tests/regression/test_llm_annotation_runtime_compatibility.py
+```
+
+Normal tests inject local generation and must not load a GGUF. The existing acceptance test remains
+the only opt-in real-model load/generation check. Any new audit violation needs a seeded fixture that
+either produces a named failed finding or fails closed before a report. Phase 7 iteration or
+specialist roles remain optional and require a predeclared benefit over the single analyst.
 
 ## Documentation ownership
 

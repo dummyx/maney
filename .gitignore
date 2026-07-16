@@ -21,6 +21,7 @@ wheels/
 /data/processed/
 /reports/
 /models/
+/agent_artifacts/
 notebooks/.ipynb_checkpoints/
 
 # OS/editor

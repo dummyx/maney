@@ -112,6 +112,40 @@ elsewhere, keep them out of version control too. Bronze ingestion is append-only
 content-addressed. Do not edit raw payloads or sidecars; ingest a new version and preserve both
 records.
 
+## Research-agent threat model
+
+The optional research-agent sidecar implements a local proposal workflow plus separately authorized
+development and one-time holdout evaluation. It remains disabled by default and exposes no paper or
+broker action. Its controls address these threats:
+
+- Prompt injection: source text is untrusted data and cannot name tools, change host instructions,
+  request hidden data, or define executable actions. The gateway dispatches only strict typed action
+  variants from a literal mapping.
+- Source rights: the exporter requires availability, retention, license/terms, content-status, and
+  hashed-identity assertions. Those assertions are audit metadata and are not legal permission.
+- Final-holdout leakage: a strict field-level exporter constructs a new bundle; it does not forward
+  generic artifacts. Future, final-holdout, paper, broker, order, account, position, target-weight,
+  secret, and path fields are excluded and tested with misleading and nested fixtures.
+- Paper and broker isolation: model-capable modules have no import or callable path to pipeline,
+  backtest, portfolio, paper, broker, account, position, intent, or order code. Proposals cannot
+  authorize execution.
+- Environment and filesystem leakage: the action catalog contains no environment, arbitrary path,
+  shell, Python, SQL, network, clock, or secret-store tool. A versioned environment scrub is
+  defense-in-depth; it is not an operating-system sandbox.
+- Local resource exhaustion: model steps, tool calls, evidence pages, bytes, context/output tokens,
+  wall time, and retained artifacts are bounded before generation. Exhaustion fails the attempt and
+  never yields a partially accepted proposal.
+- Corrupt storage and concurrent writers: authoritative JSONL replays fail closed on malformed,
+  noncanonical, duplicate-key, incomplete, non-finite, reordered, or broken-chain data. One
+  nonblocking global advisory lock serializes registry transitions. Automatic truncation is
+  forbidden.
+- Human contamination: software cannot prevent a person from pasting holdout facts into a question,
+  inspecting results outside the registry, or misdeclaring lineage. The workflow records this as a
+  limitation and requires conservative external holdout-use registration for confirmatory claims.
+
+The sidecar is a model-capability boundary, not an OS sandbox. Stronger process isolation is
+a separate hardening task and must not be implied by verifier or import-firewall tests.
+
 ## Research, paper, and live boundaries
 
 - Research stages create features, labels, models, predictions, hypothetical backtests, and reports.

@@ -19,6 +19,72 @@ examples in supplier-friendly form.
 | Silver to gold labels | The outcome starts strictly after the decision on official sessions. |
 | Gold to model | Training includes only labels observable before the embargoed cutoff. |
 | Prediction to replay | The whole decision cross-section is evaluated with costs and constraints. |
+| Agent study to registry | Canonical typed content, explicit expected-head concurrency, fixed proposal budget, and valid state transitions. |
+| Agent round to ledger | One run/study/attempt identity, contiguous steps, canonical JSON, and an unbroken prior-round hash chain. |
+
+## Research-agent authority contracts
+
+The local agent-study workflow uses these strict, frozen contracts across proposal, approved
+development, candidate-freeze, and one-time holdout boundaries:
+
+- `StudyDefinition` freezes the research question, analysis cutoff, development and reserved-holdout
+  ranges, data/feature/label/target identities, required baseline and benchmark paths, negative
+  controls, robustness checks, metrics, proposal budget, permitted parameter spaces, local-model and
+  host-contract identities, seeds, and known limitations. `study_id` is the SHA-256 of canonical
+  typed content excluding the ID itself.
+- `HoldoutIdentity` binds sorted input hashes and asset IDs to data lineage, universe, calendar,
+  market/label/target/return-adjustment contracts, decision/outcome intervals, study, and frozen
+  candidate. Its canonical content determines `holdout_id`; the registry derives a conservative
+  overlap projection from these fields. Registration records use, but does not reveal or execute,
+  a holdout.
+- `ResearchProposal` and `ResearchAbstention` are mutually exclusive terminal analyst outputs. A
+  proposal must include supporting evidence, counterevidence or a bounded challenge search,
+  falsification and invalidation conditions, an allowed experiment template and parameter choices,
+  all required learned/fixed baselines, negative controls, sensitivity checks, failure modes,
+  limitations, expected metrics, and an interpretation. They contain no order, paper, broker,
+  account, path, shell, network, Python, SQL, or arbitrary-expression field.
+- Evidence, metric, calculation, quantitative-claim, development-view-manifest, artifact-manifest,
+  generation-diagnostic, verification, and typed action contracts bind every reference to explicit
+  identities and content hashes. `ResearchAgentAction` has exactly three top-level variants: one
+  typed allowlisted tool call, one terminal proposal, or one terminal abstention. Unknown fields and
+  non-finite numeric values are rejected.
+
+`RegistryEvent` has two identities. `event_id` hashes its semantic body without sequence and prior
+hash, while `event_hash` hashes the full chained event except `event_hash` itself. Registry replay
+requires canonical one-line JSON, strict UTC timestamps, unique IDs, a contiguous one-based sequence,
+the genesis/prior-event hash chain, and legal folded state. Every mutation supplies the caller's
+expected global head; a stale head fails before append.
+
+`ResearchAgentRound` similarly has a content-derived `round_id` and `previous_round_hash`.
+`ResearchAgentRoundLedger` requires contiguous steps and one fixed run, study, and attempt identity.
+It preserves model requests, raw output, parsed typed actions, tool results, diagnostics, and checks
+before the next generation can proceed. Passing replay proves structural consistency and
+tamper-evidence, not semantic truth or authenticated authorship.
+
+`ExperimentExecutionDefinition` is an inert typed mapping from one passed proposal to the single
+`matched_feature_ablation_v1` template. `DevelopmentExecutionApproval` binds its exact definition and
+verification hashes before any pipeline work. `DevelopmentResultManifest`,
+`FrozenDevelopmentModelManifest`, and `CandidateFreezeRecord` then bind the approved run, frozen
+model bytes, required evaluation contract, candidate config, and `HoldoutIdentity`. The development
+definition binds both reserved decision and outcome ranges. The runner uses the decision start as an
+exclusive information cutoff for label end and availability. The runner also verifies required
+learned-family and fixed-benchmark coverage. Its
+`required_evaluation_contract.json` preserves negative-control and robustness declarations as
+`predeclared_not_executed`; those scenarios belong to the separate downstream evaluator.
+Candidate freeze derives that contract hash and the candidate template/patch fields from these
+authoritative artifacts before appending `candidate_frozen`; the human choice is limited to a learned
+family that the frozen model actually contains.
+
+A reveal uses `holdout_reveal_reserved` before reading reserved data and terminates in either
+`holdout_revealed` or `holdout_reveal_failed`; both consume the overlapping identity. The result
+manifest records zero training updates, model hashes before and after prediction, exact input,
+feature, label, prediction, backtest, evaluation-contract, cost, constraint, and attempt-snapshot
+hashes. External use records have the same conservative overlap effect. The global holdout-use
+projection adds one `reveal_reservation` record at reservation time and preserves that same record
+after failure or successful completion; completion never adds a second use record. Deterministic
+audit and
+downstream-evaluation reports are content-identified immutable summaries, not approvals or trading
+authority.
 
 ## Timestamp semantics
 

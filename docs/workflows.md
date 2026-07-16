@@ -82,6 +82,73 @@ Pipeline commands and `validate-config` accept:
 
 The overrides become part of the immutable typed config and therefore affect the config hash.
 
+## Local research-agent study
+
+This optional workflow is disabled by default and creates no broker or paper authority. Trusted
+state-changing commands stay under `nlp-trader agent-study`; the model-capable executable contains
+only `propose`, `verify`, and `replay`.
+
+```mermaid
+flowchart LR
+    create["create and reserve"] --> export["sealed development view"]
+    export --> propose["local proposal or abstention"]
+    propose --> verify["deterministic verification"]
+    verify --> approve["human approval"]
+    approve --> develop["development-only run"]
+    develop --> freeze["human candidate freeze"]
+    freeze --> reveal["one-time holdout reveal"]
+    reveal --> audit["deterministic audit"]
+```
+
+Start from strict JSON inputs and inspect each command's required paths:
+
+```bash
+uv run nlp-trader agent-study create --help
+uv run nlp-trader agent-study reserve-attempt --help
+uv run nlp-trader agent-study export-view --help
+uv run nlp-trader-agent propose --help
+uv run nlp-trader-agent verify --help
+uv run nlp-trader-agent replay --help
+```
+
+`create` registers an immutable `StudyDefinition`. `reserve-attempt` consumes one budget slot before
+model generation. `export-view` verifies a completed source manifest and constructs a new field-level
+bundle containing development diagnostics, an evidence snapshot/index, and a feature catalog; it
+does not pass the source-run path through to the analyst. `propose` requires an enabled independent
+agent config and one direct local GGUF, while normal tests inject a generator. `verify` and `replay`
+never load the model.
+
+After human review of a passed proposal:
+
+```bash
+uv run nlp-trader agent-study compile --help
+uv run nlp-trader agent-study approve-development --help
+uv run nlp-trader agent-study run-development --help
+uv run nlp-trader agent-study freeze-candidate --help
+uv run nlp-trader agent-study reveal-holdout --help
+uv run nlp-trader agent-study audit --help
+uv run nlp-trader agent-study close --help
+```
+
+Compilation is inert and maps only allowlisted typed template fields. Development cannot start until
+`approve-development` records the exact verification and definition hashes. The internal
+`development_only` scope emits no `final_holdout` key or file. After reviewing that result, a human
+either closes the study or freezes one exact candidate. `reveal-holdout` reserves contamination
+before reading reserved data, uses the frozen model without a training update, and cannot be repeated
+or automatically retried after failure.
+
+Register a holdout inspected outside this workflow before making a confirmatory claim against the
+same lineage:
+
+```bash
+uv run nlp-trader agent-study register-external-holdout --help
+```
+
+The global overlap rule matches data lineage and materially equivalent label/target contracts when
+asset memberships intersect and outcome intervals overlap. A different filename or study name does
+not reset the lineage. Software cannot detect a falsely declared lineage or a human copying holdout
+facts out of band; both remain explicit limitations.
+
 ## Runtime filter semantics
 
 ### Dates

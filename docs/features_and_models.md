@@ -316,6 +316,34 @@ check; neither it nor the fake tests establish research usefulness.
 See [Research protocol](research_protocol.md) for the sidecar-first experiment and pretrained-memory
 limitation, and [Outputs](outputs.md) for the DecisionRound boundary.
 
+## Agent-study deterministic templates
+
+`matched_feature_ablation_v1` is the only executable proposal template. It maps the proposal's typed
+`text_decay_days` choice to `features.text_decay_half_life_days`; free-form text cannot change config.
+The compiler freezes the base config, development and reserved intervals, family/control lists,
+metrics, costs, constraints, universe, seeds, and artifact schemas. Development training uses all
+complete approved development rows and zero final-holdout periods. The emitted model records
+`development_training` and cannot contain `final_holdout_training`.
+
+`selector_signal_matrix_v1` is a separate post-compiler comparison. At every decision it records the
+eligible membership, input availability and hash, scores, ranks, selection, seed, lookback, skip,
+and selector hash for full eligible, repeated seeded random-k, causal momentum, and causal
+low-volatility selectors. Every cell uses the same coordinated portfolio/backtest engine and cost,
+fill, liquidity, and constraint semantics. Moving-block intervals and Holm adjustment are available
+for predeclared downstream comparisons; they do not turn a backtest into evidence of profitability.
+
+The robustness builder deterministically constructs early/late endpoint shifts, moves candidate
+scores only to later decisions for causal-delay tests, shuffles scores within decision
+cross-sections, and verifies that upstream source-ablation predictions preserve exact membership.
+Every variant runs through the same cost-aware engine. The evaluator requires each tried proposal
+candidate to retain every result alongside baseline results. Regime and behavior annotations are
+explicit inputs, not inferred narratives. Missing scenarios, attempts, period matches, or annotations
+fail the report.
+
+This robustness builder is a separate post-compiler API. The development-only runner does not call
+it; that runner records the predeclared scenario IDs as not executed in its required-evaluation
+contract.
+
 ## Current modeling limits
 
 - No nonlinear tree model is implemented yet.

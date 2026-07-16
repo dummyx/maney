@@ -24,6 +24,9 @@ extra automatic mode directory.
 The shared content-addressed raw root is different: identical source bytes can be referenced by many
 runs without being copied into every run directory.
 
+The independent research-agent artifact root is also outside this pipeline layout. No normal command
+or smoke run creates or reads it.
+
 ## Start with these files
 
 | Question | Artifact |
@@ -42,6 +45,67 @@ runs without being copied into every run directory.
 | Where are standalone broker actions audited? | Current-user kabuS state `audit.jsonl`; this is outside research run artifacts and paper evidence |
 | How many rows trained each snapshot? | `model.json` snapshot counts, role, and training-key digest; its final-holdout protocol records the frozen boundary/cutoff, while exact keys are not stored by default |
 | Why did a run fail? | `reports.../<run_id>/run.failed.json` plus stage logs |
+
+## Research-agent authority artifacts
+
+The separately configured agent artifact root owns the complete study lineage:
+
+```text
+<agent artifact root>/
+  registry/research_events.jsonl
+  registry/research_events.jsonl.lock
+  studies/<study_id>/definition.json
+  studies/<study_id>/approvals/<approval_id>.json
+  studies/<study_id>/candidate/{candidate_config,freeze}.json
+  views/<bundle_id>/bundle.manifest.json
+  views/<bundle_id>/{development_view,feature_catalog,evidence_index}.json
+  views/<bundle_id>/evidence_snapshot.jsonl
+  runs/<agent_run_id>/reports/{run.initial,config.snapshot,terminal,proposal_verification,run.final}.json
+  runs/<agent_run_id>/model/{rounds.jsonl,prompt.txt,provenance.json,...}
+  runs/<agent_run_id>/model/{generation_attempts,responses}/<step>.json
+  runs/<agent_run_id>/tools/{requests,results}/<step>.json
+  runs/<agent_run_id>/tools/summary.json
+  compiled/<definition_id>/{execution_definition,base_config.snapshot,compiler_provenance,manifest}.json
+  development_runs/<development_run_id>/{result_manifest,frozen_model,...}.json
+  development_runs/<development_run_id>/required_evaluation_contract.json
+  holdout_reveals/<reservation_id>/{predictions,backtests,metrics,result_manifest}.json
+  audits/<report_id>.json
+```
+
+The development runner and registered holdout evaluator also use their registry IDs as normal
+pipeline run IDs under the configured interim, processed, model, and report roots. Each report root
+contains exactly one terminal `run.final.json` or `run.failed.json`. A successful development or
+holdout `result_manifest.json` binds its final-manifest hash; the post-reveal audit checks both hashes
+and rehashes both manifests' complete artifact lists.
+
+The root is created with current-user-only permissions, must not be a symlink, and is gitignored by
+the bundled configuration. Each content-identified directory and file is written exclusively; a
+retry cannot overwrite prior evidence.
+
+`research_events.jsonl` is the one global authority chain. It records study registration, attempt
+reservation/completion, verification, development approval/start/completion/failure, candidate
+freeze, reveal reservation/completion/failure, external use, and closure.
+Each append holds one nonblocking advisory lock, replays the entire chain, checks the caller's
+expected head, validates the transition, durably appends one canonical JSON line, and fsyncs it.
+Attempt reservation occurs before a model-capable phase would start and permanently consumes one
+budget slot, including failed or abstained attempts. A reveal reservation likewise creates the one
+global holdout-use record immediately; that record remains contaminating after failure and is not
+duplicated when reveal completes.
+
+Each `rounds.jsonl` is a separate hash chain for one run/study/attempt trace. It requires contiguous
+steps and a link to the previous round. Both ledgers reject symlinks, non-regular files, invalid
+UTF-8, duplicate keys, blank/partial/noncanonical lines, non-finite values, unknown fields, sequence
+or hash gaps, identity changes, and illegal state transitions. The lock and hash chains are local
+tamper-evidence and concurrency controls, not authenticated signatures or trusted timestamps.
+
+An `AgentArtifactManifest` binds normalized relative paths, schemas, sizes, hashes, Git provenance,
+parents, limitations, and next questions. Development results contain no reserved-result field or
+file. Their required-evaluation contract records verified learned/fixed-family coverage and
+explicitly marks predeclared negative-control and robustness scenarios as not executed by the
+development runner. Holdout results are separate and bind the frozen model before/after hash, zero
+training updates, inputs, features, labels, predictions, backtests, metrics, that evaluation
+contract, attempts, and registry reservation. Audit reports list every named deterministic check and
+do not change study state.
 
 ## Full layout
 

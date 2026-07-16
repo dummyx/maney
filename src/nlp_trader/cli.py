@@ -7,6 +7,7 @@ from typing import Annotated, Any
 import typer
 
 from nlp_trader import pipeline
+from nlp_trader.agent_study import agent_study_app
 from nlp_trader.broker.cli import broker_app
 from nlp_trader.config import ResearchConfig, RuntimeConfig, TransformerConfig, load_config
 from nlp_trader.data.synthetic import generate_synthetic_fixture
@@ -57,6 +58,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(broker_app, name="broker")
+app.add_typer(agent_study_app, name="agent-study")
 
 
 @app.callback()

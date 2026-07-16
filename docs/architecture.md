@@ -174,6 +174,64 @@ Provider and store protocols keep vendor, storage, calendar, and model implement
 without coupling them to feature or backtest logic. No constructor or import performs external data
 access.
 
+## Research-agent sidecar
+
+The research-agent system is a separate local capability boundary, not a standard pipeline stage.
+`ResearchAgentConfig` and its artifact root are independent of `ResearchConfig`; installing the
+subsystem leaves ordinary manifests, reports, paper behavior, and broker behavior unchanged.
+
+The model-capable `nlp_trader.research_agents` package reads only a sealed typed development bundle.
+Architecture tests reject imports from it to `nlp_trader.cli`, `pipeline`, `paper`, `portfolio`,
+`backtest`, or `broker`. Its separate `nlp-trader-agent` entry point exposes only bounded proposal,
+verification, and replay. The action union permits four typed read-only tools or one terminal
+proposal/abstention. It exposes no arbitrary path, environment, network, shell, Python, SQL, clock,
+paper, portfolio, account, broker, order, or position capability.
+
+Trusted `nlp-trader agent-study` commands live on the execution side of the boundary. They own the
+global registry, field-level exporter, inert compiler, exact human approval, development-only runner,
+candidate freeze, one-time reveal, external-use registration, and deterministic audit. No proposal
+or verifier outcome invokes these commands automatically.
+
+```mermaid
+flowchart TD
+    registry["Locked global study and holdout registry"]
+    exporter["Trusted sealed-view exporter"]
+    analyst["Import-isolated local analyst"]
+    compiler["Inert typed compiler"]
+    development["Approved development-only pipeline scope"]
+    freeze["Immutable candidate freeze"]
+    reveal["Reserved one-time holdout evaluation"]
+    audit["Deterministic audit"]
+    registry --> exporter --> analyst --> compiler --> development --> freeze --> reveal --> audit
+    registry --> compiler
+    registry --> development
+    registry --> freeze
+    registry --> reveal
+```
+
+The registry is the sole lifecycle authority and uses one nonblocking lock, expected-head mutation,
+canonical chained JSONL, durable append, and full replay before every transition. Per-agent-run rounds
+use a separate chained ledger. Neutral lock/write mechanics are shared through
+`nlp_trader.immutable`; broker and research transitions remain separate.
+
+Development execution uses an explicit scope outside `ResearchConfig`, trains with no final-holdout
+period, and rejects any reserved-result `final_holdout` key or file. Whole label cross-sections whose
+end or availability reaches the registered holdout decision start are purged before training. The
+canonical config snapshot still retains the unused `final_holdout_periods` setting so its bytes
+reproduce the reported config hash. Approval, development execution, reveal, and audit share one
+compiled-artifact loader for the fixed content-addressed directory, canonical manifest and files,
+and typed base snapshot. Approval separately reloads the registered terminal proposal to derive the
+only permitted typed patch; execution reconstructs the exact human approval from its registry event
+and immutable record before starting. Reveal first records a globally contaminating
+reservation, then validates the exact compiled base-config identity, reapplies the frozen typed
+patch, loads the exact frozen model, and builds only the registered interval. It predicts without
+training and writes results outside analyst-visible roots. Each auxiliary development or holdout
+pipeline execution always terminates with `run.final.json` or `run.failed.json`; its successful
+result binds the exact final-manifest bytes, and the deterministic audit rehashes every artifact
+listed by both manifests.
+Ordinary standard runs remain backward compatible; their final-holdout use is outside automatic
+enforcement unless registered as external use.
+
 ## Execution modes
 
 `sample` mode is a minutes-scale synthetic smoke path. `full` mode uses the same pipeline with

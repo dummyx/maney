@@ -2,11 +2,13 @@
 
 [日本語で読む](README.ja.md)
 
-NLP Trader runs repeatable trading-strategy experiments from local files. It helps answer one
-question: does text you are allowed to use add useful information beyond price and volume data?
+Does text you are allowed to use add useful information beyond price and volume data? NLP Trader
+runs repeatable local experiments to test that question.
 
-The project is designed for research on a laptop. It records the inputs, settings, code version,
-and results for every run so another engineer can inspect or repeat the work.
+One article that was unavailable at the historical decision time can make a result look better than
+it was. The project therefore checks when each input became available and records the inputs,
+settings, code version, and results for every run. Another engineer can inspect or repeat the work
+on a laptop.
 
 > All results are hypothetical. They are not financial advice and do not show that a strategy will
 > make money. Research and simulated paper-trading (`paper`) commands never send orders. The
@@ -137,6 +139,30 @@ the full model file can load and produce a valid reply on your machine.
 
 For setup and output details, read [Configuration](docs/configuration.md),
 [Features and models](docs/features_and_models.md), and [Outputs](docs/outputs.md).
+
+## Optional local research-agent studies
+
+The optional research-agent workflow is also off by default. It lets a bounded local analyst inspect
+a sealed development-only bundle, use four read-only typed tools, and produce a proposal or
+abstention. A deterministic verifier checks references, controls, point-in-time rules, and forbidden
+capabilities. The analyst cannot run experiments, reveal a holdout, create paper intents, or place
+orders.
+
+Trusted `nlp-trader agent-study ...` commands handle the authority lifecycle: create and reserve a
+study, export a sealed view, compile a verified proposal, record human development approval, run a
+development-only comparison, freeze one candidate, reveal its registered holdout once, and audit the
+lineage. Model-capable `propose`, `verify`, and `replay` commands live in the separate
+`nlp-trader-agent` executable. The ordinary pipeline remains unchanged when this subsystem is unused.
+
+```bash
+uv run nlp-trader agent-study --help
+uv run nlp-trader-agent --help
+```
+
+This is a local research-governance workflow, not an autonomous trader. Development execution needs
+an exact human approval, candidate freeze is irreversible, holdout overlap is tracked globally, and
+all outputs remain hypothetical. See [Workflows](docs/workflows.md#local-research-agent-study) and
+[Research protocol](docs/research_protocol.md#local-agent-study-protocol).
 
 ## Important limits
 

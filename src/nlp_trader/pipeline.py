@@ -8,10 +8,10 @@ import os
 import time as clock
 from bisect import bisect_left
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from nlp_trader.backtest.engine import DeterministicBacktestEngine
 from nlp_trader.calendars import USEquityCalendar
@@ -232,6 +232,96 @@ def _corporate_action_to_record(action: CorporateAction) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class PipelineExecutionScope:
+    mode: Literal["standard", "development_only", "holdout_evaluation"] = "standard"
+    decision_start: datetime | None = None
+    decision_end: datetime | None = None
+    development_information_cutoff: datetime | None = None
+
+    def __post_init__(self) -> None:
+        timestamps = (
+            self.decision_start,
+            self.decision_end,
+            self.development_information_cutoff,
+        )
+        if any(value is not None and value.tzinfo is None for value in timestamps):
+            raise ValueError("pipeline execution-scope timestamps must be timezone-aware")
+        if self.mode == "standard" and any(value is not None for value in timestamps):
+            raise ValueError("standard pipeline scope cannot override research boundaries")
+        if self.mode == "development_only":
+            if any(value is None for value in timestamps):
+                raise ValueError("development-only scope requires all temporal boundaries")
+            assert self.decision_start is not None
+            assert self.decision_end is not None
+            assert self.development_information_cutoff is not None
+            if self.decision_end < self.decision_start:
+                raise ValueError("development-only decision boundary is reversed")
+            if self.decision_end >= self.development_information_cutoff:
+                raise ValueError("development decisions must precede the information cutoff")
+        if self.mode == "holdout_evaluation":
+            if self.decision_start is None or self.decision_end is None:
+                raise ValueError("holdout evaluation requires exact decision boundaries")
+            if self.development_information_cutoff is not None:
+                raise ValueError("holdout evaluation does not accept a development cutoff")
+            if self.decision_end < self.decision_start:
+                raise ValueError("holdout evaluation decision boundary is reversed")
+
+
+def _development_rows_before_information_cutoff(
+    features: list[dict[str, Any]],
+    labels: list[dict[str, Any]],
+    *,
+    cutoff: datetime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep only whole decision/horizon groups observable before development closes."""
+
+    labels_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for label in labels:
+        key = _feature_label_key(label)
+        if key in labels_by_key:
+            raise ValueError(f"duplicate development label row: {key}")
+        labels_by_key[key] = label
+    grouped_keys: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for feature in features:
+        key = _feature_label_key(feature)
+        if key not in labels_by_key:
+            raise ValueError(f"development feature has no matching label: {key}")
+        grouped_keys.setdefault((key[1], key[2]), []).append(key)
+
+    retained: set[tuple[str, str, str]] = set()
+    for (asof_ts, horizon), keys in sorted(grouped_keys.items()):
+        eligible = [_label_is_available_before(labels_by_key[key], cutoff=cutoff) for key in keys]
+        if any(eligible) and not all(eligible):
+            raise ValueError(
+                "development information cutoff would partially select the asset cross-section "
+                f"at {asof_ts} horizon {horizon}"
+            )
+        if all(eligible):
+            retained.update(keys)
+    if not retained:
+        raise ValueError("development information cutoff leaves no complete label cross-section")
+    return (
+        [row for row in features if _feature_label_key(row) in retained],
+        [row for row in labels if _feature_label_key(row) in retained],
+    )
+
+
+def _label_is_available_before(row: dict[str, Any], *, cutoff: datetime) -> bool:
+    label_end = row.get("label_end_ts")
+    available_at = row.get("label_available_at")
+    return (
+        isinstance(label_end, str)
+        and isinstance(available_at, str)
+        and parse_utc(label_end) < cutoff
+        and parse_utc(available_at) < cutoff
+    )
+
+
+def _feature_label_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return str(row["asset_id"]), str(row["asof_ts"]), str(row["horizon"])
+
+
 class PipelineExecution:
     """One immutable, dependency-aware local research execution."""
 
@@ -241,11 +331,13 @@ class PipelineExecution:
         context: RunContext,
         *,
         llm_generator: LLMGenerator | None = None,
+        execution_scope: PipelineExecutionScope | None = None,
     ) -> None:
         self.config = config
         self.context = context
         self.enable_transformer_sentiment = config.transformer.enabled
         self.llm_generator = llm_generator
+        self.execution_scope = execution_scope or PipelineExecutionScope()
         self.outputs: dict[str, Any] = {"run_id": context.run_id}
         self.completed: set[str] = set()
         self.assets: list[Asset] = []
@@ -273,11 +365,23 @@ class PipelineExecution:
 
     @property
     def start(self) -> datetime | None:
-        return _runtime_bound(self.config.runtime.start_date, end=False)
+        configured = _runtime_bound(self.config.runtime.start_date, end=False)
+        scoped = self.execution_scope.decision_start
+        return (
+            max(value for value in (configured, scoped) if value is not None)
+            if any(value is not None for value in (configured, scoped))
+            else None
+        )
 
     @property
     def end(self) -> datetime | None:
-        return _runtime_bound(self.config.runtime.end_date, end=True)
+        configured = _runtime_bound(self.config.runtime.end_date, end=True)
+        scoped = self.execution_scope.decision_end
+        return (
+            min(value for value in (configured, scoped) if value is not None)
+            if any(value is not None for value in (configured, scoped))
+            else None
+        )
 
     def _runtime_context_calendar(self, *extra: datetime) -> USEquityCalendar:
         anchors = [value for value in (*extra, self.start, self.end) if value is not None]
@@ -1330,6 +1434,14 @@ class PipelineExecution:
         self.labels = [
             row for row in label_context if self._is_decision_timestamp(str(row["asof_ts"]))
         ]
+        if self.execution_scope.mode == "development_only":
+            cutoff = self.execution_scope.development_information_cutoff
+            assert cutoff is not None
+            self.features, self.labels = _development_rows_before_information_cutoff(
+                self.features,
+                self.labels,
+                cutoff=cutoff,
+            )
         records: list[dict[str, Any]] = []
         for row in self.labels:
             record = dict(row)
@@ -1345,15 +1457,25 @@ class PipelineExecution:
         self.outputs["labels"] = [str(path) for path in paths]
 
     def train(self) -> None:
+        development_only = self.execution_scope.mode == "development_only"
         self.model = train_baselines(
             self.features,
             self.labels,
             model_version=self.config.features.model_version,
             min_train_rows=self.config.models.min_train_rows,
             embargo_periods=self.config.models.embargo_periods,
-            final_holdout_periods=self.config.models.final_holdout_periods,
+            final_holdout_periods=(
+                0 if development_only else self.config.models.final_holdout_periods
+            ),
             families=self.config.models.families,
         )
+        if development_only:
+            training = self.model.pop("final_holdout_training")
+            self.model["development_training"] = {
+                "name": "causal_development_walk_forward_v1",
+                "enabled": True,
+                "update_rule": training["update_rule"],
+            }
         registry = LocalModelRegistry(self.context.paths.models)
         path = registry.save_model(
             self.config.features.model_version,
@@ -1367,6 +1489,7 @@ class PipelineExecution:
         self.outputs["model"] = path
 
     def predict(self) -> None:
+        development_only = self.execution_scope.mode == "development_only"
         self.predictions = predict_all_families(self.features, self.model)
         prediction_paths: list[str] = []
         for _family, rows in sorted(self.predictions.items()):
@@ -1388,9 +1511,21 @@ class PipelineExecution:
             self.labels,
             context_rows=self.features,
             top_k=self.config.models.top_k,
-            final_holdout_periods=self.config.models.final_holdout_periods,
-            final_holdout_training=self.model["final_holdout_training"],
+            final_holdout_periods=(
+                0 if development_only else self.config.models.final_holdout_periods
+            ),
+            final_holdout_training=(
+                None if development_only else self.model["final_holdout_training"]
+            ),
         )
+        if development_only:
+            protocol = self.evaluation["evaluation_protocol"]
+            self.evaluation["evaluation_protocol"] = {
+                "name": "causal_development_walk_forward_v1",
+                "selection_scope": "development_only",
+                "development_periods": protocol["development_periods"],
+                "purge_rule": protocol["purge_rule"],
+            }
         registry = LocalModelRegistry(self.context.paths.models)
         registry.record_metrics(self.config.features.model_version, self.evaluation)
         self.outputs["predictions"] = prediction_paths
@@ -1401,6 +1536,60 @@ class PipelineExecution:
 
     def backtest(self) -> None:
         engine = DeterministicBacktestEngine()
+        if self.execution_scope.mode == "development_only":
+            label_keys = {
+                (str(row["asset_id"]), str(row["asof_ts"]), str(row["horizon"]))
+                for row in self.labels
+                if row.get("forward_return") is not None
+            }
+            for family, rows in sorted(self.predictions.items()):
+                selection_depth = (
+                    None if family in {"equal_weight", "no_trade"} else self.config.models.top_k
+                )
+                development_rows = [
+                    row
+                    for row in rows
+                    if (str(row["asset_id"]), str(row["asof_ts"]), str(row["horizon"]))
+                    in label_keys
+                ]
+                if not development_rows:
+                    raise ValueError("development-only backtest has no fully observed rows")
+                result = engine.run(
+                    development_rows,
+                    self.labels,
+                    self.config.backtest,
+                    top_k=selection_depth,
+                )
+                result["evaluation_window"] = {
+                    "name": "development_only",
+                    "end_inclusive": format_utc(self.end) if self.end is not None else None,
+                }
+                self.backtests[family] = result
+                _write_json_once(
+                    self.context.paths.processed / "backtests" / family / "backtest.json",
+                    result,
+                )
+            comparison = {
+                "artifact_schema_version": "development-backtest-comparison-v1",
+                "run_id": self.context.run_id,
+                "config_hash": self.config.content_hash(),
+                "execution_scope": "development_only",
+                "assumptions": {
+                    "horizon_steps": self.config.features.horizon_days,
+                    "rebalance_frequency": self.config.backtest.rebalance_frequency,
+                    "top_k": self.config.models.top_k,
+                    "costs_and_constraints": self.config.backtest.model_dump(mode="json"),
+                },
+                "families": {
+                    family: result["metrics"] for family, result in sorted(self.backtests.items())
+                },
+            }
+            self.outputs["backtests"] = str(self.context.paths.processed / "backtests")
+            self.outputs["backtest_comparison"] = _write_json_once(
+                self.context.paths.processed / "evaluation" / "backtest_comparison.json",
+                comparison,
+            )
+            return
         protocol = self.evaluation.get("evaluation_protocol", {})
         holdout_start_value = protocol.get("final_holdout_start")
         if not isinstance(holdout_start_value, str):
@@ -1791,11 +1980,12 @@ class PipelineExecution:
                 "portfolio": {
                     family: result["metrics"] for family, result in sorted(self.backtests.items())
                 },
-                "portfolio_final_holdout": {
+            }
+            if self.execution_scope.mode == "standard":
+                metrics["portfolio_final_holdout"] = {
                     family: result["metrics"]
                     for family, result in sorted(self.final_holdout_backtests.items())
-                },
-            }
+                }
             if self.llm_annotation_summary:
                 metrics["llm_annotations"] = self.llm_annotation_summary
             return metrics
@@ -1821,6 +2011,8 @@ def run_to_stage(
     stage: str,
     *,
     llm_generator: LLMGenerator | None = None,
+    execution_scope: PipelineExecutionScope | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     target = "report" if stage == "smoke" else stage.replace("-", "_")
     if target not in DEPENDENCIES:
@@ -1828,7 +2020,32 @@ def run_to_stage(
     errors = validate_config(config)
     if errors:
         raise ValueError("; ".join(errors))
-    context = create_run_context(config)
+    scope = execution_scope or PipelineExecutionScope()
+    context = create_run_context(config, run_id=run_id)
+    if scope.mode == "development_only":
+        assert scope.decision_start is not None
+        assert scope.decision_end is not None
+        assert scope.development_information_cutoff is not None
+        scope_payload = {
+            "mode": scope.mode,
+            "decision_start": format_utc(scope.decision_start),
+            "decision_end": format_utc(scope.decision_end),
+            "development_information_cutoff": format_utc(scope.development_information_cutoff),
+        }
+        _write_json_once(
+            context.paths.reports / "execution_scope.json",
+            {
+                "artifact_schema_version": "pipeline-execution-scope-v1",
+                **scope_payload,
+                "scope_hash": hashlib.sha256(
+                    json.dumps(
+                        scope_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
     LOGGER.info(
         "run_start run_id=%s target=%s mode=%s",
         context.run_id,
@@ -1839,6 +2056,7 @@ def run_to_stage(
         config,
         context,
         llm_generator=llm_generator,
+        execution_scope=scope,
     )
     try:
         execution.run(target)

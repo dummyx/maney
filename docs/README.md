@@ -1,7 +1,7 @@
 # Documentation
 
-This page is the map for NLP Trader’s documentation. You do not need to read everything before
-running the sample.
+You do not need to read every page before running NLP Trader. Start with the path that matches the
+decision in front of you; the exact schemas and invariants remain available when you need them.
 
 For a plain-language introduction in Japanese, read the [Japanese README](../README.ja.md).
 
@@ -27,6 +27,10 @@ after the synthetic sample works.
 4. [Research protocol](research_protocol.md)
 5. [Backtesting assumptions](backtesting.md)
 6. [Compliance and safety](compliance.md)
+
+For the optional governed local proposal workflow, read
+[Workflows](workflows.md#local-research-agent-study), then
+[Research protocol](research_protocol.md#local-agent-study-protocol).
 
 ### I want to change the code
 

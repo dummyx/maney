@@ -28,6 +28,7 @@ nlp = [
 
 [project.scripts]
 nlp-trader = "nlp_trader.cli:main"
+nlp-trader-agent = "nlp_trader.research_agents.cli:main"
 
 [build-system]
 requires = ["setuptools>=69"]

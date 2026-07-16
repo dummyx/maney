@@ -36,6 +36,23 @@ available memory.
 - Do not place input files inside raw/interim/processed/model/report artifact roots.
 - Do not edit an input while a run is capturing it; the run will detect a hash mismatch and fail.
 
+## Sealed agent-study inputs
+
+The research analyst never receives arbitrary source-run files. The trusted `agent-study export-view`
+adapter verifies every referenced source artifact against the completed manifest, rejects nested or
+misleading holdout fields, and writes a separately hashed bundle with:
+
+- sanitized development metrics and a feature/control/template catalog;
+- permitted evidence whose `available_at` is no later than the study cutoff;
+- deterministic lexical spans and pagination identities; and
+- content status, relationship type, license/terms reference, retention permission, source hash,
+  active-membership result, and hashed author/URL identities when supplied.
+
+Missing availability, source hashes, rights metadata, retention permission, or active membership
+fails export. The bundle contains no source path, raw final-holdout value, paper/broker/account/order
+state, secret, environment value, URL, or callable code. Hashing a social identity in a Silver bundle
+does not remove any raw identity retained in immutable Bronze; source terms still govern retention.
+
 ## Required input 1: asset master
 
 Minimal CSV:
